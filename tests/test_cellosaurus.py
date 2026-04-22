@@ -189,7 +189,6 @@ def test_map_chipatlas_returns_new_dataframe_with_expected_columns(tmp_path: Pat
     assert list(result.columns) == list(OUTPUT_COLUMNS)
     assert len(result) == len(df)
     assert result is not df
-    # Input unchanged.
     assert list(df.columns) == ["cell_type"]
 
 

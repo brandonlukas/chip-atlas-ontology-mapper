@@ -25,4 +25,3 @@ def update_ontologies(
     """
     cfg = config or load_config(cache_dir=cache_dir)
     cellosaurus.refresh_cache(cfg.cache_dir, force=force)
-    # Stage 3 will add EFO download + FAISS build here.

@@ -6,7 +6,7 @@ import json
 import pickle
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO
 
@@ -192,6 +192,23 @@ def load_lookup(cache_root: Path) -> CellosaurusLookup:
         return pickle.load(f)
 
 
+_LOOKUP_CACHE: dict[Path, CellosaurusLookup] = {}
+
+
+def get_cached_lookup(cache_root: Path) -> CellosaurusLookup:
+    """Load the Cellosaurus lookup, reusing an in-memory copy across calls.
+
+    The unpickled lookup is ~27 MB; callers typically invoke `map_chipatlas`
+    many times per process. `refresh_cache` clears this when it re-downloads.
+    """
+    cached = _LOOKUP_CACHE.get(cache_root)
+    if cached is not None:
+        return cached
+    lookup = load_lookup(cache_root)
+    _LOOKUP_CACHE[cache_root] = lookup
+    return lookup
+
+
 def is_cached(cache_root: Path) -> bool:
     d = _cache_dir(cache_root)
     return (d / "lookup.pkl").exists() and (d / "metadata.json").exists()
@@ -209,14 +226,15 @@ def refresh_cache(
     re-downloading.
     """
     if not force and is_cached(cache_root):
-        return load_lookup(cache_root)
+        return get_cached_lookup(cache_root)
 
     d = _cache_dir(cache_root)
     d.mkdir(parents=True, exist_ok=True)
     raw = d / "cellosaurus.txt"
     download_cellosaurus(raw, url=url)
     entries, version = parse_cellosaurus(raw)
-    downloaded_at = datetime.now(timezone.utc).isoformat()
+    downloaded_at = datetime.now(UTC).isoformat()
     lookup = build_lookup(entries, version, downloaded_at)
     save_lookup(cache_root, lookup)
+    _LOOKUP_CACHE.pop(cache_root, None)
     return lookup

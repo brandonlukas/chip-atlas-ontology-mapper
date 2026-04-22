@@ -10,9 +10,10 @@ from caom.config import Config, load_config
 from caom.ontologies.cellosaurus import (
     CellosaurusEntry,
     CellosaurusLookup,
-    load_lookup,
+    get_cached_lookup,
 )
 from caom.schema import validate_input
+from caom.types import Mapping
 from caom.version import __version__
 
 _ASSEMBLY_PREFIX_TO_TAXON: tuple[tuple[str, str], ...] = (
@@ -31,17 +32,7 @@ _ASSEMBLY_PREFIX_TO_TAXON: tuple[tuple[str, str], ...] = (
     ("grcz", "7955"),
 )
 
-OUTPUT_COLUMNS: tuple[str, ...] = (
-    "cell_type",
-    "status",
-    "ontology_id",
-    "ontology_label",
-    "confidence",
-    "rationale",
-    "ontology_source",
-    "ontology_version",
-    "caom_version",
-)
+OUTPUT_COLUMNS: tuple[str, ...] = tuple(Mapping.model_fields)
 
 
 def _taxon_id_from_assembly(assembly: object) -> str | None:
@@ -54,43 +45,43 @@ def _taxon_id_from_assembly(assembly: object) -> str | None:
     return None
 
 
-def _mapped_row(
+def _mapped(
     cell_type: str,
     entry: CellosaurusEntry,
     ontology_version: str,
     *,
     rationale: str,
-) -> dict:
-    return {
-        "cell_type": cell_type,
-        "status": "mapped",
-        "ontology_id": entry.accession,
-        "ontology_label": entry.primary_name,
-        "confidence": 1.0,
-        "rationale": rationale,
-        "ontology_source": "cellosaurus",
-        "ontology_version": ontology_version,
-        "caom_version": __version__,
-    }
+) -> Mapping:
+    return Mapping(
+        cell_type=cell_type,
+        status="mapped",
+        ontology_id=entry.accession,
+        ontology_label=entry.primary_name,
+        confidence=1.0,
+        rationale=rationale,
+        ontology_source="cellosaurus",
+        ontology_version=ontology_version,
+        caom_version=__version__,
+    )
 
 
-def _unmappable_row(
+def _unmappable(
     cell_type: str,
     ontology_version: str,
     *,
     rationale: str,
-) -> dict:
-    return {
-        "cell_type": cell_type,
-        "status": "unmappable",
-        "ontology_id": None,
-        "ontology_label": None,
-        "confidence": None,
-        "rationale": rationale,
-        "ontology_source": None,
-        "ontology_version": ontology_version,
-        "caom_version": __version__,
-    }
+) -> Mapping:
+    return Mapping(
+        cell_type=cell_type,
+        status="unmappable",
+        ontology_id=None,
+        ontology_label=None,
+        confidence=None,
+        rationale=rationale,
+        ontology_source=None,
+        ontology_version=ontology_version,
+        caom_version=__version__,
+    )
 
 
 def _map_row(
@@ -98,9 +89,9 @@ def _map_row(
     assembly_value: object,
     lookup: CellosaurusLookup,
     ontology_version: str,
-) -> dict:
+) -> Mapping:
     if not isinstance(cell_type_value, str) or not cell_type_value.strip():
-        return _unmappable_row(
+        return _unmappable(
             cell_type=cell_type_value if isinstance(cell_type_value, str) else "",
             ontology_version=ontology_version,
             rationale="Missing or empty cell_type.",
@@ -110,22 +101,20 @@ def _map_row(
     taxon_id = _taxon_id_from_assembly(assembly_value)
     candidates = lookup.lookup(cell_type, taxon_id=taxon_id)
 
-    if not candidates and taxon_id is not None:
-        # Retry without species filter — metadata may be missing or use an
-        # uncommon assembly. The LLM tier (Stage 4) will disambiguate later.
-        unfiltered = lookup.lookup(cell_type)
-        if unfiltered:
-            return _unmappable_row(
-                cell_type=cell_type,
-                ontology_version=ontology_version,
-                rationale=(
-                    f"Cellosaurus match(es) found but none for taxon {taxon_id} "
-                    f"(assembly={assembly_value!r}); deferred to EFO/LLM tier."
-                ),
-            )
+    if not candidates and taxon_id is not None and lookup.lookup(cell_type):
+        # Don't promote a cross-species match: symmetric normalization means
+        # the hit could be coincidental. Defer to the Stage 4 LLM tier.
+        return _unmappable(
+            cell_type=cell_type,
+            ontology_version=ontology_version,
+            rationale=(
+                f"Cellosaurus match(es) found but none for taxon {taxon_id} "
+                f"(assembly={assembly_value!r}); deferred to EFO/LLM tier."
+            ),
+        )
 
     if len(candidates) == 1:
-        return _mapped_row(
+        return _mapped(
             cell_type=cell_type,
             entry=candidates[0],
             ontology_version=ontology_version,
@@ -134,7 +123,7 @@ def _map_row(
 
     if len(candidates) > 1:
         accs = ", ".join(c.accession for c in candidates)
-        return _unmappable_row(
+        return _unmappable(
             cell_type=cell_type,
             ontology_version=ontology_version,
             rationale=(
@@ -143,7 +132,7 @@ def _map_row(
             ),
         )
 
-    return _unmappable_row(
+    return _unmappable(
         cell_type=cell_type,
         ontology_version=ontology_version,
         rationale="No Cellosaurus match; deferred to EFO/LLM tier.",
@@ -193,12 +182,15 @@ def map_chipatlas(
             "review=True surfaces top-K EFO candidates, which lands in Stage 3."
         )
 
-    lookup = load_lookup(cfg.cache_dir)
+    lookup = get_cached_lookup(cfg.cache_dir)
     ontology_version = f"cellosaurus:{lookup.version}" if lookup.version else "cellosaurus"
 
-    assemblies = df["assembly"] if "assembly" in df.columns else [None] * len(df)
+    cell_types = df["cell_type"].tolist()
+    assemblies = (
+        df["assembly"].tolist() if "assembly" in df.columns else [None] * len(df)
+    )
     rows = [
-        _map_row(ct, asm, lookup, ontology_version)
-        for ct, asm in zip(df["cell_type"].tolist(), list(assemblies), strict=False)
+        _map_row(ct, asm, lookup, ontology_version).model_dump()
+        for ct, asm in zip(cell_types, assemblies, strict=True)
     ]
     return pd.DataFrame(rows, columns=list(OUTPUT_COLUMNS))
