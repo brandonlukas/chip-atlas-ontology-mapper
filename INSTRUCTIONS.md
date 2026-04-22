@@ -11,7 +11,7 @@ Downstream consumer: the `matcha` project (`~/code/matcha`). The parquet at `~/c
 ## Current status
 
 - **Stage 1: skeleton + pyproject + env** — DONE (commit pending)
-  - conda env `caom` exists with Python 3.11 and all deps installed editable
+  - conda env `caom` exists with Python 3.12 and all deps installed editable
   - Public API stubs (`map_chipatlas`, `update_ontologies`) import and raise `NotImplementedError`
   - `pytest tests/test_skeleton.py` passes (4 tests)
 - **Stage 2: Cellosaurus fast-path** — NEXT

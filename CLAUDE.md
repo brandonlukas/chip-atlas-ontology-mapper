@@ -9,7 +9,7 @@ conda activate caom
 If the env does not exist yet, create it before installing anything:
 
 ```bash
-conda create -n caom python=3.11 -y
+conda create -n caom python=3.12 -y
 conda activate caom
 pip install -e '.[dev]'
 ```

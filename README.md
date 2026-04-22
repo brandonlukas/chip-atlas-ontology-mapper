@@ -19,7 +19,7 @@ All inference runs locally; the only network calls are the initial ontology down
 Create a dedicated conda env and install in editable mode:
 
 ```bash
-conda create -n caom python=3.11 -y
+conda create -n caom python=3.12 -y
 conda activate caom
 pip install -e '.[dev]'
 ```
