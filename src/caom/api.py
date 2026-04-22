@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
 
+from caom.cache import get_cached_llm_cache
 from caom.config import Config, load_config
+from caom.llm.client import LLMClient, OllamaClient
+from caom.llm.prompts import build_rerank_prompt
 from caom.ontologies.cellosaurus import (
     CellosaurusEntry,
     CellosaurusLookup,
@@ -17,7 +21,7 @@ from caom.retrieval.embedder import get_cached_embedder as _get_cached_embedder
 from caom.retrieval.index import EFOIndex
 from caom.retrieval.index import get_cached_index as _get_cached_index
 from caom.schema import validate_input
-from caom.types import Candidate, Mapping, ReviewRow
+from caom.types import Candidate, LLMPick, Mapping, ReviewRow
 from caom.version import __version__
 
 _ASSEMBLY_PREFIX_TO_TAXON: tuple[tuple[str, str], ...] = (
@@ -36,14 +40,50 @@ _ASSEMBLY_PREFIX_TO_TAXON: tuple[tuple[str, str], ...] = (
     ("grcz", "7955"),
 )
 
+_EFO_QUERY_COLUMNS: tuple[str, ...] = (
+    "cell_type_class",
+    "cell_type_description",
+    "title",
+)
+
+_LLM_METADATA_COLUMNS: tuple[str, ...] = (
+    "cell_type_class",
+    "cell_type_description",
+    "assembly",
+    "title",
+    "antigen",
+    "tf_name",
+)
+
 OUTPUT_COLUMNS: tuple[str, ...] = tuple(Mapping.model_fields)
 REVIEW_COLUMNS: tuple[str, ...] = tuple(ReviewRow.model_fields)
 
 
+def _nonempty_str(v: object) -> str | None:
+    """Return a stripped string if `v` is a non-empty string, else None."""
+    if isinstance(v, str):
+        s = v.strip()
+        if s:
+            return s
+    return None
+
+
+def _row_str_fields(row: pd.Series, cols: Iterable[str]) -> dict[str, str]:
+    """Collect stripped non-empty string values from `row` for the given `cols`."""
+    out: dict[str, str] = {}
+    for c in cols:
+        if c in row.index:
+            s = _nonempty_str(row[c])
+            if s is not None:
+                out[c] = s
+    return out
+
+
 def _taxon_id_from_assembly(assembly: object) -> str | None:
-    if not isinstance(assembly, str) or not assembly:
+    s = _nonempty_str(assembly)
+    if s is None:
         return None
-    a = assembly.lower()
+    a = s.lower()
     for prefix, taxon in _ASSEMBLY_PREFIX_TO_TAXON:
         if a.startswith(prefix):
             return taxon
@@ -56,12 +96,10 @@ def _assembly_list(df: pd.DataFrame) -> list[object]:
     return [None] * len(df)
 
 
-def _mapped(
+def _mapped_cellosaurus(
     cell_type: str,
     entry: CellosaurusEntry,
     ontology_version: str,
-    *,
-    rationale: str,
 ) -> Mapping:
     return Mapping(
         cell_type=cell_type,
@@ -69,7 +107,7 @@ def _mapped(
         ontology_id=entry.accession,
         ontology_label=entry.primary_name,
         confidence=1.0,
-        rationale=rationale,
+        rationale="Exact match via Cellosaurus normalized-name lookup.",
         ontology_source="cellosaurus",
         ontology_version=ontology_version,
         caom_version=__version__,
@@ -99,77 +137,53 @@ def _cellosaurus_candidates(
     cell_type_value: object,
     assembly_value: object,
     lookup: CellosaurusLookup,
-) -> tuple[list[CellosaurusEntry], str | None]:
-    """Return (candidates, unmappable_rationale).
+) -> list[CellosaurusEntry]:
+    """Return Cellosaurus candidates for the row, or `[]` if none survive.
 
-    If `unmappable_rationale` is not None, the caller should skip EFO retrieval
-    in best-pick mode; it explains why.
+    Cross-species hits (the cell_type matches at some taxon but not the
+    taxon implied by `assembly`) are dropped rather than promoted: the
+    retrieval + LLM tier is the right place to adjudicate them.
     """
-    if not isinstance(cell_type_value, str) or not cell_type_value.strip():
-        return [], "Missing or empty cell_type."
-
+    if _nonempty_str(cell_type_value) is None:
+        return []
     taxon_id = _taxon_id_from_assembly(assembly_value)
-    candidates = lookup.lookup(cell_type_value, taxon_id=taxon_id)
-
-    if not candidates and taxon_id is not None and lookup.lookup(cell_type_value):
-        # Don't promote a cross-species match: symmetric normalization means
-        # the hit could be coincidental. Defer to the Stage 4 LLM tier.
-        return (
-            [],
-            f"Cellosaurus match(es) found but none for taxon {taxon_id} "
-            f"(assembly={assembly_value!r}); deferred to EFO/LLM tier.",
-        )
-    return candidates, None
+    return lookup.lookup(cell_type_value, taxon_id=taxon_id)  # type: ignore[arg-type]
 
 
-def _map_row(
-    cell_type_value: object,
-    assembly_value: object,
-    lookup: CellosaurusLookup,
-    ontology_version: str,
-) -> Mapping:
-    if not isinstance(cell_type_value, str) or not cell_type_value.strip():
-        return _unmappable(
-            cell_type=cell_type_value if isinstance(cell_type_value, str) else "",
-            ontology_version=ontology_version,
-            rationale="Missing or empty cell_type.",
-        )
+def _efo_query_text(cell_type: str, row: pd.Series) -> str:
+    """Build the retrieval query string from `cell_type` + optional metadata."""
+    parts = [cell_type, *_row_str_fields(row, _EFO_QUERY_COLUMNS).values()]
+    return " | ".join(parts)
 
-    cell_type = cell_type_value
-    candidates, deferred_reason = _cellosaurus_candidates(
-        cell_type_value, assembly_value, lookup
+
+def _llm_metadata(row: pd.Series) -> dict[str, str]:
+    return _row_str_fields(row, _LLM_METADATA_COLUMNS)
+
+
+def _cellosaurus_entry_to_candidate(entry: CellosaurusEntry) -> Candidate:
+    """Project a Cellosaurus entry into the unified Candidate shape for the LLM."""
+    meta_parts: list[str] = []
+    if entry.species:
+        meta_parts.append(f"organism: {', '.join(entry.species)}")
+    if entry.category:
+        meta_parts.append(f"category: {entry.category}")
+    definition = "; ".join(meta_parts) if meta_parts else None
+    return Candidate(
+        ontology_id=entry.accession,
+        ontology_label=entry.primary_name,
+        ontology_source="cellosaurus",
+        synonyms=list(entry.synonyms),
+        definition=definition,
     )
 
-    if deferred_reason is not None:
-        return _unmappable(
-            cell_type=cell_type,
-            ontology_version=ontology_version,
-            rationale=deferred_reason,
-        )
 
-    if len(candidates) == 1:
-        return _mapped(
-            cell_type=cell_type,
-            entry=candidates[0],
-            ontology_version=ontology_version,
-            rationale="Exact match via Cellosaurus normalized-name lookup.",
-        )
-
-    if len(candidates) > 1:
-        accs = ", ".join(c.accession for c in candidates)
-        return _unmappable(
-            cell_type=cell_type,
-            ontology_version=ontology_version,
-            rationale=(
-                f"Ambiguous Cellosaurus match ({len(candidates)} candidates: {accs}); "
-                "deferred to EFO/LLM tier."
-            ),
-        )
-
-    return _unmappable(
-        cell_type=cell_type,
-        ontology_version=ontology_version,
-        rationale="No Cellosaurus match; deferred to EFO/LLM tier.",
+def _build_llm_candidates(
+    cellosaurus_entries: list[CellosaurusEntry],
+    efo_candidates: list[Candidate],
+) -> list[Candidate]:
+    """Unify Cellosaurus (first) + EFO candidates into one ordered list."""
+    return [_cellosaurus_entry_to_candidate(e) for e in cellosaurus_entries] + list(
+        efo_candidates
     )
 
 
@@ -218,15 +232,38 @@ def _review_rows_for(
     return rows
 
 
-def _efo_query_text(cell_type: str, row: pd.Series) -> str:
-    """Build the retrieval query string from the cell_type + optional metadata."""
-    parts: list[str] = [cell_type]
-    for col in ("cell_type_class", "cell_type_description", "title"):
-        if col in row.index:
-            v = row[col]
-            if isinstance(v, str) and v.strip():
-                parts.append(v.strip())
-    return " | ".join(parts)
+def _classify_rows(
+    df: pd.DataFrame,
+    lookup: CellosaurusLookup,
+) -> tuple[list[str], list[list[CellosaurusEntry]]]:
+    """Return `(normalized_cell_types, per_row_candidates)` aligned with `df`.
+
+    `normalized_cell_types[i]` is the stripped string, or `""` when the input
+    cell_type is missing/blank. `per_row_candidates[i]` is `[]` in that case
+    (short-circuiting Cellosaurus lookup for invalid rows).
+    """
+    assemblies = _assembly_list(df)
+    normalized = [_nonempty_str(ct) or "" for ct in df["cell_type"].tolist()]
+    per_row_cand = [
+        _cellosaurus_candidates(nt, asm, lookup) if nt else []
+        for nt, asm in zip(normalized, assemblies, strict=True)
+    ]
+    return normalized, per_row_cand
+
+
+def _retrieve_efo(
+    df: pd.DataFrame,
+    indices: list[int],
+    normalized: list[str],
+    efo_index: EFOIndex,
+    embedder: EmbedderProtocol,
+    top_k: int,
+) -> dict[int, list[Candidate]]:
+    if not indices:
+        return {}
+    queries = [_efo_query_text(normalized[i], df.iloc[i]) for i in indices]
+    batches = efo_index.search_texts(queries, embedder=embedder, top_k=top_k)
+    return dict(zip(indices, batches, strict=True))
 
 
 def _run_review(
@@ -238,32 +275,16 @@ def _run_review(
     cellosaurus_version: str,
     efo_version: str,
 ) -> pd.DataFrame:
-    cell_types_raw = df["cell_type"].tolist()
-    assemblies = _assembly_list(df)
-
-    need_retrieval_idx: list[int] = []
-    per_row_cand: list[list[CellosaurusEntry]] = []
-    for i, (ct, asm) in enumerate(zip(cell_types_raw, assemblies, strict=True)):
-        cands, _deferred = _cellosaurus_candidates(ct, asm, lookup)
-        per_row_cand.append(cands)
-        if len(cands) != 1:
-            need_retrieval_idx.append(i)
-
-    efo_results: dict[int, list[Candidate]] = {}
-    if need_retrieval_idx:
-        queries = [
-            _efo_query_text(str(cell_types_raw[i] or ""), df.iloc[i])
-            for i in need_retrieval_idx
-        ]
-        batches = efo_index.search_texts(queries, embedder=embedder, top_k=top_k)
-        for i, cands in zip(need_retrieval_idx, batches, strict=True):
-            efo_results[i] = cands
+    normalized, per_row_cand = _classify_rows(df, lookup)
+    need_retrieval = [i for i, cands in enumerate(per_row_cand) if len(cands) != 1]
+    efo_results = _retrieve_efo(
+        df, need_retrieval, normalized, efo_index, embedder, top_k
+    )
 
     out_rows: list[dict] = []
-    for i, ct in enumerate(cell_types_raw):
-        cell_type_str = ct if isinstance(ct, str) else ""
+    for i, ct in enumerate(normalized):
         rev_rows = _review_rows_for(
-            cell_type=cell_type_str,
+            cell_type=ct,
             cellosaurus_candidates=per_row_cand[i],
             efo_candidates=efo_results.get(i, []),
             cellosaurus_version=cellosaurus_version,
@@ -272,6 +293,127 @@ def _run_review(
         out_rows.extend(r.model_dump() for r in rev_rows)
 
     return pd.DataFrame(out_rows, columns=list(REVIEW_COLUMNS))
+
+
+def _pick_to_mapping(
+    cell_type: str,
+    pick: LLMPick,
+    candidates: list[Candidate],
+    *,
+    cellosaurus_version: str,
+    efo_version: str,
+) -> Mapping:
+    combined_version = f"{cellosaurus_version};{efo_version}"
+    if pick.ontology_id is None:
+        return _unmappable(
+            cell_type=cell_type,
+            ontology_version=combined_version,
+            rationale=(
+                f"LLM: {pick.rationale}" if pick.rationale else "LLM returned no match."
+            ),
+        )
+    cand = next((c for c in candidates if c.ontology_id == pick.ontology_id), None)
+    if cand is None:
+        return _unmappable(
+            cell_type=cell_type,
+            ontology_version=combined_version,
+            rationale=(
+                f"LLM returned non-candidate id {pick.ontology_id!r} "
+                f"(discarded as hallucination). Original rationale: {pick.rationale}"
+            ),
+        )
+    version = cellosaurus_version if cand.ontology_source == "cellosaurus" else efo_version
+    return Mapping(
+        cell_type=cell_type,
+        status="mapped",
+        ontology_id=cand.ontology_id,
+        ontology_label=cand.ontology_label,
+        confidence=pick.confidence,
+        rationale=pick.rationale,
+        ontology_source=cand.ontology_source,
+        ontology_version=version,
+        caom_version=__version__,
+    )
+
+
+def _default_llm_client(cfg: Config) -> LLMClient:
+    cache = get_cached_llm_cache(cfg.cache_dir)
+    return OllamaClient(model=cfg.llm_model, host=cfg.ollama_host, cache=cache)
+
+
+def _run_best_pick(
+    df: pd.DataFrame,
+    lookup: CellosaurusLookup,
+    cfg: Config,
+    top_k: int,
+    embedder: EmbedderProtocol | None,
+    llm_client: LLMClient | None,
+    cellosaurus_version: str,
+) -> pd.DataFrame:
+    normalized, per_row_cand = _classify_rows(df, lookup)
+    needs_llm = [
+        i
+        for i, (nt, cands) in enumerate(zip(normalized, per_row_cand, strict=True))
+        if nt and len(cands) != 1
+    ]
+
+    efo_results: dict[int, list[Candidate]] = {}
+    efo_version = ""
+    llm: LLMClient | None = None
+    if needs_llm:
+        efo_index = _get_cached_index(cfg.cache_dir)
+        efo_version = f"efo:{efo_index.efo_version}" if efo_index.efo_version else "efo"
+        emb = (
+            embedder
+            if embedder is not None
+            else _get_cached_embedder(cfg.embedding_model)
+        )
+        llm = llm_client if llm_client is not None else _default_llm_client(cfg)
+        efo_results = _retrieve_efo(
+            df, needs_llm, normalized, efo_index, emb, top_k
+        )
+
+    out_rows: list[dict] = []
+    for i, (ct, cands) in enumerate(zip(normalized, per_row_cand, strict=True)):
+        if not ct:
+            out_rows.append(
+                _unmappable(
+                    cell_type="",
+                    ontology_version=cellosaurus_version,
+                    rationale="Missing or empty cell_type.",
+                ).model_dump()
+            )
+            continue
+        if len(cands) == 1:
+            out_rows.append(
+                _mapped_cellosaurus(
+                    cell_type=ct,
+                    entry=cands[0],
+                    ontology_version=cellosaurus_version,
+                ).model_dump()
+            )
+            continue
+
+        assert llm is not None
+        row = df.iloc[i]
+        candidates = _build_llm_candidates(cands, efo_results.get(i, []))
+        prompt = build_rerank_prompt(
+            cell_type=ct,
+            metadata=_llm_metadata(row),
+            candidates=candidates,
+        )
+        pick = llm.pick(prompt)
+        out_rows.append(
+            _pick_to_mapping(
+                cell_type=ct,
+                pick=pick,
+                candidates=candidates,
+                cellosaurus_version=cellosaurus_version,
+                efo_version=efo_version,
+            ).model_dump()
+        )
+
+    return pd.DataFrame(out_rows, columns=list(OUTPUT_COLUMNS))
 
 
 def map_chipatlas(
@@ -283,6 +425,7 @@ def map_chipatlas(
     ollama_host: str | None = None,
     llm_model: str | None = None,
     embedder: EmbedderProtocol | None = None,
+    llm_client: LLMClient | None = None,
     config: Config | None = None,
 ) -> pd.DataFrame:
     """Map ChIP-Atlas rows to standardized ontology IDs (Cellosaurus + EFO).
@@ -296,16 +439,19 @@ def map_chipatlas(
     review
         If True, return top-K retrieval candidates per input row with scores.
         If False (default), return one row per input row with the best pick
-        or `status="unmappable"`.
+        (via LLM re-rank on non-trivial cases) or `status="unmappable"`.
     top_k
-        Number of retrieval candidates surfaced per input row in review mode
-        (and, once Stage 4 lands, to the LLM re-ranker). Defaults to
-        `config.retrieval_top_k`.
+        Number of retrieval candidates surfaced per input row to the LLM
+        re-ranker (and in review mode). Defaults to `config.retrieval_top_k`.
     cache_dir, ollama_host, llm_model
         Per-call overrides. If `config` is passed, it takes precedence.
     embedder
         Optional injected embedder (mainly for tests). Defaults to the
         sentence-transformers model named in `config.embedding_model`.
+    llm_client
+        Optional injected LLM client (mainly for tests). Defaults to an
+        `OllamaClient` pointed at `config.ollama_host` with a SQLite-backed
+        response cache under `<cache_dir>/llm/`.
 
     Returns
     -------
@@ -320,27 +466,36 @@ def map_chipatlas(
     effective_top_k = top_k if top_k is not None else cfg.retrieval_top_k
 
     lookup = get_cached_lookup(cfg.cache_dir)
-    cellosaurus_version = f"cellosaurus:{lookup.version}" if lookup.version else "cellosaurus"
+    cellosaurus_version = (
+        f"cellosaurus:{lookup.version}" if lookup.version else "cellosaurus"
+    )
 
-    if not review:
-        cell_types = df["cell_type"].tolist()
-        assemblies = _assembly_list(df)
-        rows = [
-            _map_row(ct, asm, lookup, cellosaurus_version).model_dump()
-            for ct, asm in zip(cell_types, assemblies, strict=True)
-        ]
-        return pd.DataFrame(rows, columns=list(OUTPUT_COLUMNS))
+    if review:
+        efo_index = _get_cached_index(cfg.cache_dir)
+        efo_version = (
+            f"efo:{efo_index.efo_version}" if efo_index.efo_version else "efo"
+        )
+        emb = (
+            embedder
+            if embedder is not None
+            else _get_cached_embedder(cfg.embedding_model)
+        )
+        return _run_review(
+            df=df,
+            lookup=lookup,
+            efo_index=efo_index,
+            embedder=emb,
+            top_k=effective_top_k,
+            cellosaurus_version=cellosaurus_version,
+            efo_version=efo_version,
+        )
 
-    efo_index = _get_cached_index(cfg.cache_dir)
-    efo_version = f"efo:{efo_index.efo_version}" if efo_index.efo_version else "efo"
-    emb = embedder if embedder is not None else _get_cached_embedder(cfg.embedding_model)
-
-    return _run_review(
+    return _run_best_pick(
         df=df,
         lookup=lookup,
-        efo_index=efo_index,
-        embedder=emb,
+        cfg=cfg,
         top_k=effective_top_k,
+        embedder=embedder,
+        llm_client=llm_client,
         cellosaurus_version=cellosaurus_version,
-        efo_version=efo_version,
     )

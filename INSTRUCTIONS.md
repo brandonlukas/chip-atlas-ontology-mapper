@@ -24,8 +24,13 @@ Downstream consumer: the `matcha` project (`~/code/matcha`). The parquet at `~/c
   - `caom.update_ontologies()` now downloads EFO and builds/saves the FAISS index after Cellosaurus
   - `map_chipatlas(review=True)` returns `ReviewRow`s: Cellosaurus single hit → 1 row; ambiguous → all Cellosaurus candidates + EFO top-K; miss → EFO top-K. EFO queries are batched across rows in a single embedder call.
   - 50 tests passing (17 new). Tests avoid real model loads via an injected `embedder=` parameter on `map_chipatlas` + a `_FakeEmbedder` with one-hot vectors aligned to a hand-built terms DataFrame.
-- **Stage 4: Ollama LLM re-rank** — NEXT
-- **Stage 5: Ikeda validation harness + accuracy gates in CI** — pending
+- **Stage 4: Ollama LLM re-rank** — DONE
+  - `caom.cache.LLMCache`: SQLite cache keyed by `(model, prompt_hash)` persisted at `.cache/llm/llm_cache.sqlite`; round-trip verified across connection reopen
+  - `caom.llm.client`: `LLMClient` Protocol + `OllamaClient` implementation with `format=LLMPick.model_json_schema()` and `temperature=0` for deterministic / cacheable output; inner ollama client is lazy-imported
+  - `caom.llm.prompts.build_rerank_prompt`: unified candidate list (Cellosaurus first, then EFO top-K), truncates long definitions + caps synonyms, includes organism/category hints for Cellosaurus candidates, mandates verbatim-id pick or null
+  - `caom.api.map_chipatlas` best-pick wired end-to-end: single Cellosaurus hit still bypasses the LLM; ambiguous Cellosaurus + Cellosaurus miss + cross-species defer all route through retrieval → LLM; hallucinated ids (not in the offered candidate set) are discarded as unmappable
+  - 70 tests passing (20 new, split across `tests/test_llm.py` unit tests and `tests/test_best_pick.py` end-to-end tests with a `FakeLLMClient`); `tests/conftest.py` hosts shared fixtures
+- **Stage 5: Ikeda validation harness + accuracy gates in CI** — NEXT
 
 Each stage is independently useful. Stage 2 alone handles ~75% of real ChIP-Atlas contexts (cell lines).
 

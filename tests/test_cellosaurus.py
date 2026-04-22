@@ -14,60 +14,19 @@ from caom.ontologies.cellosaurus import (
     parse_cellosaurus,
     save_lookup,
 )
-
-# A minimal synthetic Cellosaurus flat file covering:
-#   - K-562 with punctuation-variant synonyms (the canonical test case)
-#   - MCF-7 (simple cell line)
-#   - A mouse cell line to exercise species filtering
-#   - A same-name-different-species pair to exercise ambiguity / taxon filter
-FIXTURE = """\
-----------------------------------------------------------------------------
-        CALIPHO group at the SIB - Swiss Institute of Bioinformatics
-----------------------------------------------------------------------------
-
- Description: Cellosaurus: a knowledge resource on cell lines
- Version: 99.9
- Last update: 01-Jan-2026
-
-----------------------------------------------------------------------------
-ID   K-562
-AC   CVCL_0004
-SY   K562; K.562; K 562; GM05372; GM05372E
-OX   NCBI_TaxID=9606; ! Homo sapiens
-CA   Cancer cell line
-DT   Created: 04-04-12; Last updated: 22-06-23; Version: 45
-//
-ID   MCF-7
-AC   CVCL_0031
-SY   MCF7; MCF 7
-OX   NCBI_TaxID=9606; ! Homo sapiens
-CA   Cancer cell line
-//
-ID   NIH-3T3
-AC   CVCL_0594
-SY   NIH/3T3; NIH 3T3; 3T3
-OX   NCBI_TaxID=10090; ! Mus musculus
-CA   Spontaneously immortalized cell line
-//
-ID   Raw 264.7
-AC   CVCL_0493
-SY   RAW264.7; RAW
-OX   NCBI_TaxID=10090; ! Mus musculus
-CA   Spontaneously immortalized cell line
-//
-ID   RAW
-AC   CVCL_XXXX
-SY   Raw
-OX   NCBI_TaxID=9606; ! Homo sapiens
-CA   Undefined cell line type
-//
-"""
+from tests.conftest import (
+    CELLOSAURUS_FIXTURE,
+    FakeEmbedder,
+    FakeLLMClient,
+    install_cellosaurus_cache,
+    install_full_cache,
+)
 
 
 @pytest.fixture
 def lookup(tmp_path: Path):
     flat = tmp_path / "cellosaurus.txt"
-    flat.write_text(FIXTURE)
+    flat.write_text(CELLOSAURUS_FIXTURE)
     entries, version = parse_cellosaurus(flat)
     return build_lookup(entries, version=version, downloaded_at="2026-01-01T00:00:00+00:00")
 
@@ -99,7 +58,7 @@ def test_normalize_name(raw, expected):
 
 def test_parse_extracts_entries_and_version(tmp_path: Path):
     flat = tmp_path / "cellosaurus.txt"
-    flat.write_text(FIXTURE)
+    flat.write_text(CELLOSAURUS_FIXTURE)
     entries, version = parse_cellosaurus(flat)
 
     assert version == "99.9"
@@ -167,24 +126,16 @@ def test_load_without_cache_raises(tmp_path: Path):
 # -- map_chipatlas end-to-end ------------------------------------------------
 
 
-def _install_fixture_cache(tmp_path: Path) -> None:
-    """Pre-populate a tmp cache dir with the fixture lookup."""
-    flat = tmp_path / "cellosaurus.txt"
-    flat.write_text(FIXTURE)
-    entries, version = parse_cellosaurus(flat)
-    save_lookup(
-        tmp_path,
-        build_lookup(entries, version=version, downloaded_at="2026-01-01T00:00:00+00:00"),
-    )
-
-
 def test_map_chipatlas_returns_new_dataframe_with_expected_columns(tmp_path: Path):
-    _install_fixture_cache(tmp_path)
+    # "UnknownCell" misses Cellosaurus → retrieval + LLM, so install both.
+    install_full_cache(tmp_path)
     from caom import map_chipatlas
     from caom.api import OUTPUT_COLUMNS
 
     df = pd.DataFrame({"cell_type": ["K-562", "MCF-7", "UnknownCell"]})
-    result = map_chipatlas(df, cache_dir=tmp_path)
+    result = map_chipatlas(
+        df, cache_dir=tmp_path, embedder=FakeEmbedder(), llm_client=FakeLLMClient()
+    )
 
     assert list(result.columns) == list(OUTPUT_COLUMNS)
     assert len(result) == len(df)
@@ -193,7 +144,7 @@ def test_map_chipatlas_returns_new_dataframe_with_expected_columns(tmp_path: Pat
 
 
 def test_map_chipatlas_cellosaurus_hits(tmp_path: Path):
-    _install_fixture_cache(tmp_path)
+    install_full_cache(tmp_path)
     from caom import map_chipatlas
 
     df = pd.DataFrame(
@@ -202,7 +153,10 @@ def test_map_chipatlas_cellosaurus_hits(tmp_path: Path):
             "assembly": ["hg38", "hg19", "hg38", "hg38"],
         }
     )
-    result = map_chipatlas(df, cache_dir=tmp_path)
+    # FakeLLMClient default: null pick → unmappable for "UnknownCell".
+    result = map_chipatlas(
+        df, cache_dir=tmp_path, embedder=FakeEmbedder(), llm_client=FakeLLMClient()
+    )
 
     assert result.loc[0, "ontology_id"] == "CVCL_0004"
     assert result.loc[0, "status"] == "mapped"
@@ -217,10 +171,11 @@ def test_map_chipatlas_cellosaurus_hits(tmp_path: Path):
     assert pd.isna(result.loc[3, "ontology_id"])
     assert pd.isna(result.loc[3, "ontology_source"])
     assert pd.isna(result.loc[3, "confidence"])
+    assert result.loc[3, "ontology_version"] == "cellosaurus:99.9;efo:99.9"
 
 
 def test_map_chipatlas_species_filter_via_assembly(tmp_path: Path):
-    _install_fixture_cache(tmp_path)
+    install_full_cache(tmp_path)
     from caom import map_chipatlas
 
     df = pd.DataFrame(
@@ -229,20 +184,20 @@ def test_map_chipatlas_species_filter_via_assembly(tmp_path: Path):
             "assembly": ["mm10", "hg38", "mm10", "hg38"],
         }
     )
-    result = map_chipatlas(df, cache_dir=tmp_path)
+    result = map_chipatlas(
+        df, cache_dir=tmp_path, embedder=FakeEmbedder(), llm_client=FakeLLMClient()
+    )
 
-    # Raw + mouse → mouse Raw 264.7
     assert result.loc[0, "ontology_id"] == "CVCL_0493"
-    # Raw + human → human RAW entry
     assert result.loc[1, "ontology_id"] == "CVCL_XXXX"
-    # NIH-3T3 is mouse-only; correct assembly maps, wrong assembly defers.
     assert result.loc[2, "ontology_id"] == "CVCL_0594"
+    # NIH-3T3 with a human assembly is deferred to LLM; fake returns null.
     assert result.loc[3, "status"] == "unmappable"
-    assert "taxon 9606" in result.loc[3, "rationale"]
+    assert result.loc[3, "ontology_version"] == "cellosaurus:99.9;efo:99.9"
 
 
 def test_map_chipatlas_without_assembly_column(tmp_path: Path):
-    _install_fixture_cache(tmp_path)
+    install_cellosaurus_cache(tmp_path)
     from caom import map_chipatlas
 
     df = pd.DataFrame({"cell_type": ["K-562", "MCF-7"]})
@@ -251,7 +206,7 @@ def test_map_chipatlas_without_assembly_column(tmp_path: Path):
 
 
 def test_map_chipatlas_handles_missing_cell_type(tmp_path: Path):
-    _install_fixture_cache(tmp_path)
+    install_cellosaurus_cache(tmp_path)
     from caom import map_chipatlas
 
     df = pd.DataFrame({"cell_type": ["K-562", None, "", "   "]})
@@ -271,9 +226,7 @@ def test_map_chipatlas_without_cache_raises(tmp_path: Path):
 
 
 def test_map_chipatlas_review_mode_requires_efo_cache(tmp_path: Path):
-    # Cellosaurus cache alone is not sufficient for review mode; the EFO
-    # FAISS index must also be present.
-    _install_fixture_cache(tmp_path)
+    install_cellosaurus_cache(tmp_path)
     from caom import map_chipatlas
 
     df = pd.DataFrame({"cell_type": ["K-562"]})
