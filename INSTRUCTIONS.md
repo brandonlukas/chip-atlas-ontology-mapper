@@ -10,12 +10,14 @@ Downstream consumer: the `matcha` project (`~/code/matcha`). The parquet at `~/c
 
 ## Current status
 
-- **Stage 1: skeleton + pyproject + env** — DONE (commit pending)
+- **Stage 1: skeleton + pyproject + env** — DONE
   - conda env `caom` exists with Python 3.12 and all deps installed editable
   - Public API stubs (`map_chipatlas`, `update_ontologies`) import and raise `NotImplementedError`
-  - `pytest tests/test_skeleton.py` passes (4 tests)
-- **Stage 2: Cellosaurus fast-path** — NEXT
-- **Stage 3: EFO download + FAISS retrieval** — pending
+- **Stage 2: Cellosaurus fast-path** — DONE
+  - `caom.ontologies.cellosaurus`: download + parse flat file, normalized-name lookup, pickled cache with `metadata.json` sidecar, in-memory cache for repeat calls
+  - `caom.update_ontologies()` orchestrates the download; `caom.map_chipatlas()` runs the fast-path per row with species filter via `assembly`, emits `Mapping` rows (schema-validated) with `ontology_source="cellosaurus"` on hits and `status="unmappable"` on misses / intra-species ambiguity
+  - 33 tests passing; live end-to-end on Cellosaurus v55.0
+- **Stage 3: EFO download + FAISS retrieval** — NEXT
 - **Stage 4: Ollama LLM re-rank** — pending
 - **Stage 5: Ikeda validation harness + accuracy gates in CI** — pending
 
