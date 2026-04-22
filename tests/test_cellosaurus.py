@@ -270,10 +270,12 @@ def test_map_chipatlas_without_cache_raises(tmp_path: Path):
         map_chipatlas(df, cache_dir=tmp_path)
 
 
-def test_map_chipatlas_review_mode_still_deferred(tmp_path: Path):
+def test_map_chipatlas_review_mode_requires_efo_cache(tmp_path: Path):
+    # Cellosaurus cache alone is not sufficient for review mode; the EFO
+    # FAISS index must also be present.
     _install_fixture_cache(tmp_path)
     from caom import map_chipatlas
 
     df = pd.DataFrame({"cell_type": ["K-562"]})
-    with pytest.raises(NotImplementedError, match="Stage 3"):
+    with pytest.raises(FileNotFoundError, match="update_ontologies"):
         map_chipatlas(df, cache_dir=tmp_path, review=True)

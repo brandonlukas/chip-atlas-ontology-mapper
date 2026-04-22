@@ -17,8 +17,14 @@ Downstream consumer: the `matcha` project (`~/code/matcha`). The parquet at `~/c
   - `caom.ontologies.cellosaurus`: download + parse flat file, normalized-name lookup, pickled cache with `metadata.json` sidecar, in-memory cache for repeat calls
   - `caom.update_ontologies()` orchestrates the download; `caom.map_chipatlas()` runs the fast-path per row with species filter via `assembly`, emits `Mapping` rows (schema-validated) with `ontology_source="cellosaurus"` on hits and `status="unmappable"` on misses / intra-species ambiguity
   - 33 tests passing; live end-to-end on Cellosaurus v55.0
-- **Stage 3: EFO download + FAISS retrieval** — NEXT
-- **Stage 4: Ollama LLM re-rank** — pending
+- **Stage 3: EFO download + FAISS retrieval** — DONE
+  - `caom.ontologies.efo`: pronto-based download + parse of EFO OWL/OBO → `terms.parquet` (columns: `ontology_id`, `label`, `synonyms`, `definition`, `parents`) + `metadata.json` sidecar; in-memory cache mirroring Cellosaurus
+  - `caom.retrieval.embedder`: `SentenceTransformerEmbedder` wrapper producing L2-normalized float32 vectors with an in-memory model cache (default `pritamdeka/S-PubMedBert-MS-MARCO`)
+  - `caom.retrieval.index`: FAISS `IndexFlatIP` over label+synonyms+definition concatenations, row-aligned with the terms parquet and persisted at `.cache/embeddings/efo.{faiss,metadata.json}` + `efo_terms.parquet`
+  - `caom.update_ontologies()` now downloads EFO and builds/saves the FAISS index after Cellosaurus
+  - `map_chipatlas(review=True)` returns `ReviewRow`s: Cellosaurus single hit → 1 row; ambiguous → all Cellosaurus candidates + EFO top-K; miss → EFO top-K. EFO queries are batched across rows in a single embedder call.
+  - 50 tests passing (17 new). Tests avoid real model loads via an injected `embedder=` parameter on `map_chipatlas` + a `_FakeEmbedder` with one-hot vectors aligned to a hand-built terms DataFrame.
+- **Stage 4: Ollama LLM re-rank** — NEXT
 - **Stage 5: Ikeda validation harness + accuracy gates in CI** — pending
 
 Each stage is independently useful. Stage 2 alone handles ~75% of real ChIP-Atlas contexts (cell lines).

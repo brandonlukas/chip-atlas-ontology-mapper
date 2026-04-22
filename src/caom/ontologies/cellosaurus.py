@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import pickle
 import re
 from dataclasses import dataclass, field
@@ -11,6 +10,8 @@ from pathlib import Path
 from typing import IO
 
 import requests
+
+from caom.cache import KeyedCache, ontology_cache_dir, write_metadata_sidecar
 
 CELLOSAURUS_URL = "https://ftp.expasy.org/databases/cellosaurus/cellosaurus.txt"
 
@@ -158,7 +159,7 @@ def build_lookup(
 
 
 def _cache_dir(cache_root: Path) -> Path:
-    return cache_root / "ontologies" / "cellosaurus"
+    return ontology_cache_dir(cache_root, "cellosaurus")
 
 
 def save_lookup(cache_root: Path, lookup: CellosaurusLookup) -> None:
@@ -166,18 +167,15 @@ def save_lookup(cache_root: Path, lookup: CellosaurusLookup) -> None:
     d.mkdir(parents=True, exist_ok=True)
     with open(d / "lookup.pkl", "wb") as f:
         pickle.dump(lookup, f, protocol=pickle.HIGHEST_PROTOCOL)
-    (d / "metadata.json").write_text(
-        json.dumps(
-            {
-                "source": "cellosaurus",
-                "version": lookup.version,
-                "downloaded_at": lookup.downloaded_at,
-                "entry_count": len(lookup.entries),
-                "name_key_count": len(lookup.name_index),
-            },
-            indent=2,
-        )
-        + "\n"
+    write_metadata_sidecar(
+        d,
+        {
+            "source": "cellosaurus",
+            "version": lookup.version,
+            "downloaded_at": lookup.downloaded_at,
+            "entry_count": len(lookup.entries),
+            "name_key_count": len(lookup.name_index),
+        },
     )
 
 
@@ -192,7 +190,7 @@ def load_lookup(cache_root: Path) -> CellosaurusLookup:
         return pickle.load(f)
 
 
-_LOOKUP_CACHE: dict[Path, CellosaurusLookup] = {}
+_LOOKUP_CACHE: KeyedCache[Path, CellosaurusLookup] = KeyedCache()
 
 
 def get_cached_lookup(cache_root: Path) -> CellosaurusLookup:
@@ -201,12 +199,7 @@ def get_cached_lookup(cache_root: Path) -> CellosaurusLookup:
     The unpickled lookup is ~27 MB; callers typically invoke `map_chipatlas`
     many times per process. `refresh_cache` clears this when it re-downloads.
     """
-    cached = _LOOKUP_CACHE.get(cache_root)
-    if cached is not None:
-        return cached
-    lookup = load_lookup(cache_root)
-    _LOOKUP_CACHE[cache_root] = lookup
-    return lookup
+    return _LOOKUP_CACHE.get_or_load(cache_root, lambda: load_lookup(cache_root))
 
 
 def is_cached(cache_root: Path) -> bool:
@@ -236,5 +229,5 @@ def refresh_cache(
     downloaded_at = datetime.now(UTC).isoformat()
     lookup = build_lookup(entries, version, downloaded_at)
     save_lookup(cache_root, lookup)
-    _LOOKUP_CACHE.pop(cache_root, None)
+    _LOOKUP_CACHE.invalidate(cache_root)
     return lookup
