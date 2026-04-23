@@ -12,6 +12,7 @@ from caom.retrieval.index import (
     EFOIndex,
     build_corpus_text,
     build_index,
+    filter_corpus,
     get_cached_index,
     is_cached,
     load_index,
@@ -147,3 +148,85 @@ def test_get_cached_index_reuses_in_memory_copy(tmp_path: Path):
     b = get_cached_index(tmp_path)
     assert a is b
     assert isinstance(a, EFOIndex)
+
+
+# -- filter_corpus (Stage 7) -------------------------------------------------
+
+
+def _row(ontology_id: str) -> dict:
+    return {
+        "ontology_id": ontology_id,
+        "label": ontology_id,
+        "synonyms": [],
+        "definition": None,
+        "parents": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "allowed_id",
+    [
+        "CL:0000624",       # T cell
+        "UBERON:0002048",   # lung
+        "EFO:0001187",      # HEK293
+        "CLO:0001230",      # cell line entry
+        "BTO:0000001",      # BRENDA tissue
+        "MONDO:0004992",    # cancer
+        "Orphanet:586",     # rare disease
+        "NCIT:C12439",      # NCI thesaurus
+        "FBbt:00005106",    # Drosophila anatomy
+        "FBdv:00005334",    # Drosophila development
+        "ZFA:0000001",      # zebrafish anatomy
+        "MA:0000001",       # mouse anatomy
+        "FMA:7195",         # FMA
+        "PO:0025001",       # Plant Ontology
+        "WBls:0000001",     # C. elegans life stage
+    ],
+)
+def test_filter_corpus_keeps_allowed_prefixes(allowed_id: str):
+    df = pd.DataFrame([_row(allowed_id)])
+    out = filter_corpus(df)
+    assert list(out["ontology_id"]) == [allowed_id]
+
+
+@pytest.mark.parametrize(
+    "excluded_id",
+    [
+        "PR:000001",           # protein
+        "HGNC:5",              # gene symbol
+        "OBA:0000001",         # biological attribute
+        "GO:0008150",          # biological process
+        "NCBITaxon:9606",      # taxon
+        "HP:0000001",          # human phenotype
+        "CHEBI:15377",         # chemical
+        "dbpedia:Paris",       # geographic
+        "UO:0000001",          # unit
+        "HANCESTRO:0004",      # ancestry
+        "PATO:0000001",        # phenotypic attribute
+        "SO:0000001",          # sequence
+        "GSSO:000001",         # sex/gender
+    ],
+)
+def test_filter_corpus_drops_excluded_prefixes(excluded_id: str):
+    df = pd.DataFrame([_row(excluded_id)])
+    out = filter_corpus(df)
+    assert len(out) == 0
+
+
+def test_filter_corpus_preserves_row_order_and_resets_index():
+    df = pd.DataFrame([
+        _row("PR:000001"),
+        _row("CL:0000001"),
+        _row("OBA:0000001"),
+        _row("UBERON:0000001"),
+        _row("HGNC:5"),
+    ])
+    out = filter_corpus(df)
+    assert list(out["ontology_id"]) == ["CL:0000001", "UBERON:0000001"]
+    assert list(out.index) == [0, 1]
+
+
+def test_filter_corpus_drops_rows_with_no_prefix():
+    df = pd.DataFrame([_row("CL:0000001"), _row("no_colon_here"), _row("")])
+    out = filter_corpus(df)
+    assert list(out["ontology_id"]) == ["CL:0000001"]

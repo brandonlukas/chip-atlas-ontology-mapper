@@ -19,6 +19,55 @@ INDEX_FILENAME = "efo.faiss"
 TERMS_FILENAME = "efo_terms.parquet"
 META_FILENAME = "efo.metadata.json"
 
+# Allow-list of CURIE prefixes that are legitimate answers to "what cell /
+# tissue / cell-line / disease context was this ChIP-Atlas assay run in".
+#
+# EFO imports large slices of unrelated ontologies (PR ~17k proteins, OBA
+# ~17k biological attributes, HGNC ~6k genes, HP phenotypes, CHEBI chemicals,
+# NCBITaxon, GO, dbpedia geographic terms, etc.). Their labels lexically
+# overlap common cell-type queries (e.g. "CD4" surfaces as `PR:*` CD4 protein
+# variants rather than `CL:0000624` CD4-positive T cell), so a PubMedBert
+# cosine search over the full corpus reliably buries the correct UBERON / CL
+# / EFO answer beneath non-context noise.
+#
+# Allow-list (not deny-list) so future ontology refreshes can't silently
+# re-introduce contamination — a new import is excluded by default until a
+# human adds it here. Anything filtered out here still lives in the raw
+# `terms.parquet`; only the FAISS corpus is narrowed.
+_ALLOWED_PREFIXES: frozenset[str] = frozenset({
+    # Core context ontologies.
+    "CL",        # Cell Ontology — primary cell types
+    "UBERON",    # cross-species anatomy
+    "EFO",       # Experimental Factor Ontology (cell lines, contexts, diseases)
+    "CLO",       # Cell Line Ontology
+    "BTO",       # BRENDA Tissue Ontology
+    "MONDO",     # disease ontology
+    "Orphanet",  # rare-disease IDs surfaced via MONDO / EFO
+    "NCIT",      # cancer-type entries occasionally used as contexts
+    # Organism-specific anatomy / life-stage ontologies.
+    "FBbt",      # Drosophila anatomy
+    "FBdv",      # Drosophila development
+    "ZFA",       # zebrafish anatomy
+    "MA",        # mouse anatomy
+    "FMA",       # Foundational Model of Anatomy (human)
+    "PO",        # Plant Ontology
+    "WBls",      # C. elegans life stage
+})
+
+
+def filter_corpus(terms_df: pd.DataFrame) -> pd.DataFrame:
+    """Restrict `terms_df` to rows whose `ontology_id` prefix is allow-listed.
+
+    EFO imports unrelated ontologies (PR, OBA, HGNC, HP, CHEBI, GO, dbpedia,
+    etc.) whose labels lexically overlap cell-type queries and bury the
+    correct UBERON / CL / EFO answer in retrieval. Allow-listing (not
+    deny-list) ensures future refreshes exclude unvetted imports by default.
+    Run before embedding to skip wasted compute and prevent contamination.
+    """
+    prefixes = terms_df["ontology_id"].astype(str).str.split(":", n=1).str[0]
+    mask = prefixes.isin(_ALLOWED_PREFIXES)
+    return terms_df.loc[mask].reset_index(drop=True)
+
 
 def _cache_dir(cache_root: Path) -> Path:
     return cache_root / "embeddings"

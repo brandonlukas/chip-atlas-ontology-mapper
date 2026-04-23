@@ -33,6 +33,11 @@ def update_ontologies(
     if not force and index_mod.is_cached(cfg.cache_dir):
         return
 
+    # Narrow the FAISS corpus to legitimate ChIP-Atlas context prefixes before
+    # embedding. This both avoids ~70 MB of wasted embedding compute on PR /
+    # OBA / HGNC terms and prevents them from contaminating retrieval.
+    filtered_terms = index_mod.filter_corpus(efo_terms.terms)
+
     # Instantiate (not cache) the embedder: it's only needed for this one-shot
     # build, and the sentence-transformer eats ~500 MB of VRAM.
     emb = SentenceTransformerEmbedder(cfg.embedding_model)
@@ -41,11 +46,11 @@ def update_ontologies(
         index_mod.build_corpus_text(
             {"label": r.label, "synonyms": r.synonyms, "definition": r.definition}
         )
-        for r in efo_terms.terms.itertuples(index=False)
+        for r in filtered_terms.itertuples(index=False)
     ]
     vectors = emb.encode(corpus_texts, show_progress=True)
     efo_index = index_mod.build_index(
-        terms_df=efo_terms.terms,
+        terms_df=filtered_terms,
         embeddings=vectors,
         embedding_model=cfg.embedding_model,
         efo_version=efo_terms.version,
