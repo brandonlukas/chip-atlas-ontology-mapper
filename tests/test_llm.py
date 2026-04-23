@@ -175,6 +175,68 @@ def test_prompt_carries_stage9_exact_match_rule():
     assert "prefer them over cosine-ranked candidates" in flat
 
 
+def test_prompt_carries_stage10_substring_rule():
+    """Stage 10 added a deterministic `[substring]` marker + prompt rule.
+
+    A `[substring]` marker is rendered on any candidate whose label or
+    synonym is a case-insensitive substring of the query (or vice-versa)
+    after `normalize_name` (lowercase + strip non-alphanumerics). The rule
+    must instruct the LLM to prefer those candidates over unmarked cosine
+    candidates for plural / head-phrase queries. `[exact]` is strictly
+    stronger; Cellosaurus-prefer still overrides.
+
+    The direction must remain bidirectional (`or vice-versa`) — asymmetric
+    query rewriting is an explicit anti-goal in CLAUDE.md / INSTRUCTIONS.md.
+    """
+    flat = " ".join(build_rerank_prompt("q", {}, []).lower().split())
+    assert "[substring]" in flat
+    assert "vice-versa" in flat
+    assert "[exact]" in flat and "strictly stronger" in flat
+    # The worked example in the rule — surfaces intent if someone rewrites it.
+    assert "pancreatic islet" in flat
+
+
+def test_prompt_renders_substring_marker_symmetrically():
+    """The marker fires in both directions (query ⊂ candidate, candidate ⊂ query).
+
+    `Pancreatic islets` (query) vs synonym `pancreatic islet` (candidate-of-query):
+    the candidate-key is a substring of the query-key after normalization.
+
+    `Lung` (query) vs label `lung` would also substring-match, but since it's
+    also an exact match, `[exact]` wins. `[substring]` must NOT be rendered
+    when `[exact]` already applies (they're mutually exclusive, with `[exact]`
+    taking precedence).
+    """
+    islet_canonical = _candidate(
+        ontology_id="UBERON:0000006",
+        ontology_label="islet of Langerhans",
+        synonyms=["islets of Langerhans", "pancreatic islet"],
+        score=0.92,
+    )
+    islet_container = _candidate(
+        ontology_id="UBERON:0000016",
+        ontology_label="endocrine pancreas",
+        synonyms=["endocrine part of pancreas"],
+        score=0.90,
+    )
+    prompt = build_rerank_prompt("Pancreatic islets", {}, [islet_canonical, islet_container])
+    # Candidate-key "pancreaticislet" ⊂ query-key "pancreaticislets" → marker on [0].
+    assert "[0] [substring]" in prompt
+    # No substring relationship between "endocrinepancreas" and the query → no marker.
+    assert "[1] [substring]" not in prompt
+    assert "[1] " in prompt
+
+    # `[exact]` dominates when both could apply.
+    lung_exact = _candidate(ontology_id="UBERON:0002048", ontology_label="lung", score=1.0)
+    lung_exact.exact = True
+    prompt = build_rerank_prompt("Lung", {}, [lung_exact])
+    assert "[0] [exact]" in prompt
+    # Marker on the candidate line must be [exact], not [substring]. The rule
+    # text in the system block also mentions [substring], so match the
+    # candidate-line form specifically.
+    assert "[0] [substring]" not in prompt
+
+
 def test_prompt_renders_exact_marker_for_exact_candidates():
     candidates = [
         _candidate(

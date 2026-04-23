@@ -21,12 +21,19 @@ Calibration notes (Cellosaurus v49, EFO v3.89):
     2026-04-23, Stage 9 full pipeline (qwen2.5:14b — local 7b absent):
       n=600  acc@1=0.950  pick_precision=0.990  unmap_recall=0.964  coverage=0.495
 
+    2026-04-23, Stage 10 full pipeline (qwen2.5:7b-instruct — baseline reset):
+      n=600  acc@1=0.940  pick_precision=0.982  unmap_recall=0.983  coverage=0.483
+
+Stage 10 vs Stage 8 (both qwen2.5:7b-instruct):
+  acc@1 +0.7pp (0.933 → 0.940), pick_precision -0.7pp (0.989 → 0.982),
+  unmap_recall +0.6pp (0.977 → 0.983), coverage +0.3pp (0.480 → 0.483).
+The pick_precision dip is small (two extra false-positive-id-on-unmappable
+rows) and stays well above the 0.97 floor; the `[substring]` marker
+predominantly converts wrong-subtype picks into correct-parent picks.
+
 The gate floors below are set a few points below the observed numbers to
 absorb Cellosaurus / EFO / model-version churn. Tighten when numbers stabilize
 across a couple of stage runs; loosen if a legitimate version bump trips them.
-
-Note: Stage 9 was measured on qwen2.5:14b because the 7b-instruct model was
-not locally installed at the time. Stage 10 re-anchors the baseline to 7b.
 """
 
 from __future__ import annotations

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping as MappingABC
 
+from caom.ontologies.cellosaurus import normalize_name
 from caom.types import Candidate
 
 _SYSTEM_INSTRUCTIONS = """\
@@ -45,6 +46,14 @@ Rules:
   query (after lowercase + non-alphanumeric stripping). Prefer them over
   cosine-ranked candidates unless the disambiguation context clearly
   contradicts (wrong organism, wrong disease context, wrong cell-line series).
+- Candidates marked `[substring]` have a label or synonym that is a
+  case-insensitive substring of the query, or vice-versa, after lowercase +
+  non-alphanumeric stripping. This is the plural / head-phrase signal — e.g.
+  query "pancreatic islets" substring-matches the synonym "pancreatic islet"
+  on UBERON:0000006. Prefer `[substring]`-marked candidates over unmarked
+  cosine candidates for plural / head-phrase queries. The `[exact]` marker
+  is strictly stronger; Cellosaurus-prefer and disambiguation-context rules
+  still override `[substring]`.
 - `confidence` is a float in [0, 1] reflecting how certain you are.
 - `rationale` is one short sentence explaining the choice.
 """
@@ -55,8 +64,37 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def _format_candidate(index: int, c: Candidate) -> str:
-    marker = " [exact]" if c.exact else ""
+def _is_substring_match(query_key: str, c: Candidate) -> bool:
+    """True if query's normalized form and any candidate label/synonym are
+    substrings of each other (symmetric `in` on normalized strings).
+
+    Shares normalization with the Stage 9 exact layer (`normalize_name`:
+    lowercase + strip non-alphanumerics). `query_key` is pre-computed because
+    a prompt typically renders ~20 candidates per call.
+    """
+    if not query_key:
+        return False
+    for raw in (c.ontology_label, *c.synonyms):
+        if not raw:
+            continue
+        cand_key = normalize_name(raw)
+        if not cand_key:
+            continue
+        if query_key in cand_key or cand_key in query_key:
+            return True
+    return False
+
+
+def _candidate_marker(query_key: str, c: Candidate) -> str:
+    if c.exact:
+        return " [exact]"
+    if _is_substring_match(query_key, c):
+        return " [substring]"
+    return ""
+
+
+def _format_candidate(index: int, c: Candidate, query_key: str) -> str:
+    marker = _candidate_marker(query_key, c)
     parts = [
         f"[{index}]{marker} id={c.ontology_id} source={c.ontology_source} "
         f"label={c.ontology_label!r}"
@@ -100,8 +138,9 @@ def build_rerank_prompt(
         LLM sees cell-line matches before EFO; the caller controls ordering.
     """
     if candidates:
+        query_key = normalize_name(cell_type)
         candidates_block = "\n\n".join(
-            _format_candidate(i, c) for i, c in enumerate(candidates)
+            _format_candidate(i, c, query_key) for i, c in enumerate(candidates)
         )
     else:
         candidates_block = "(no candidates provided — return null)"
