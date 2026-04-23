@@ -36,7 +36,12 @@ Downstream consumer: the `matcha` project (`~/code/matcha`). The parquet at `~/c
   - `tests/validation/runner.py`: `Mode.CELLOSAURUS_ONLY` (injects null embedder + null LLM → measures Stage 2 alone) and `Mode.FULL` (real pipeline) drivers on top of `map_chipatlas`
   - `tests/validation/test_accuracy.py`: gated on `CAOM_RUN_VALIDATION=1`; full-pipeline sub-gate additionally needs `CAOM_RUN_LLM_VALIDATION=1`. Stage 2 baseline observed 2026-04-22: `acc@1=0.903, pick_precision=1.000, unmap_recall=0.997, coverage=0.450` (Cellosaurus v49, EFO v3.89). Gate floors set below observed to absorb version drift.
   - 87 tests passing (17 new offline: loader + metrics unit tests); 2 validation-gate tests skip by default
-- **Stage 6: full-pipeline threshold tuning (once `qwen2.5:7b-instruct` is pulled)** — NEXT
+- **Stage 6: EFO ontology-ID normalization** — NEXT
+  - Surfaced during a post-Stage-5 smoke test on 24 real ChIP-Atlas rows: the EFO candidate pipeline emits a mix of CURIE form (`UBERON:0002174`, `CL:0000623`) and full-URI form (`http://www.ebi.ac.uk/efo/EFO_0022456`) depending on the source term's `id` in the OWL. The LLM returns whichever form it saw, so downstream output is heterogeneous and will trip consumers.
+  - Scope: normalize to a single CURIE form at ingest time (`caom.ontologies.efo.parse_efo` or immediately downstream), so `terms.parquet` and the FAISS-aligned candidate list only ever carry `PREFIX:LOCAL`. Prevents the issue at the root rather than post-processing `map_chipatlas` output.
+  - Must land before Stage 7 so the full-pipeline baseline measures retrieval/LLM quality, not an ID-format artifact.
+- **Stage 7: full-pipeline threshold tuning** — after Stage 6
+  - Run `CAOM_RUN_LLM_VALIDATION=1 pytest tests/validation` to get a baseline with clean IDs, then iterate on prompt + retrieval + top-K to close the gap between Stage 2 (acc@1=0.903) and the full pipeline. Known failure mode from the smoke test: retrieval surfaces over-narrow candidates for broad queries (`Lung` → `middle lobe of right lung`, `Brain` → `diencephalon`), which prompt / parent-term augmentation should address.
 
 Each stage is independently useful. Stage 2 alone handles ~75% of real ChIP-Atlas contexts (cell lines).
 
