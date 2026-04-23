@@ -82,8 +82,20 @@ The ontology version used for each mapping is stamped on every output row (`onto
 
 ## Validation
 
-The test suite includes an accuracy gate against the [Ikeda et al. 2025 gold standard](https://doi.org/10.5281/zenodo.14881142) (~322 manually curated BioSample → Cellosaurus mappings). Run:
+The test suite includes an accuracy gate against the [Ikeda et al. 2025 gold standard](https://doi.org/10.5281/zenodo.14881142) (600 manually curated BioSample rows; 298 with Cellosaurus mappings, 302 unmappable primary-tissue cases). The free-text cell-line string (`extraction answer` column) is fed to `map_chipatlas` and the emitted ID is compared to the gold Cellosaurus accession.
 
 ```bash
-pytest tests/validation
+# Stage 2 fast-path gate (no LLM; needs Cellosaurus + EFO cache)
+CAOM_RUN_VALIDATION=1 pytest tests/validation
+
+# Full pipeline gate (additionally needs Ollama running with the configured model)
+CAOM_RUN_VALIDATION=1 CAOM_RUN_LLM_VALIDATION=1 pytest tests/validation
+```
+
+Unit tests for the harness itself (loader + metrics) run as part of the default `pytest` suite; only the accuracy gates are opt-in.
+
+Current Stage 2 baseline (Cellosaurus v49, EFO v3.89):
+
+```
+n=600  acc@1=0.903  pick_precision=1.000  unmap_recall=0.997  coverage=0.450
 ```

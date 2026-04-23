@@ -30,7 +30,13 @@ Downstream consumer: the `matcha` project (`~/code/matcha`). The parquet at `~/c
   - `caom.llm.prompts.build_rerank_prompt`: unified candidate list (Cellosaurus first, then EFO top-K), truncates long definitions + caps synonyms, includes organism/category hints for Cellosaurus candidates, mandates verbatim-id pick or null
   - `caom.api.map_chipatlas` best-pick wired end-to-end: single Cellosaurus hit still bypasses the LLM; ambiguous Cellosaurus + Cellosaurus miss + cross-species defer all route through retrieval → LLM; hallucinated ids (not in the offered candidate set) are discarded as unmappable
   - 70 tests passing (20 new, split across `tests/test_llm.py` unit tests and `tests/test_best_pick.py` end-to-end tests with a `FakeLLMClient`); `tests/conftest.py` hosts shared fixtures
-- **Stage 5: Ikeda validation harness + accuracy gates in CI** — NEXT
+- **Stage 5: Ikeda validation harness + accuracy gates** — DONE
+  - `tests/validation/ikeda_gold_standard.py`: downloads Zenodo TSV (600 rows), caches to `.cache/validation/`, normalizes `CVCL:NNNN` → `CVCL_NNNN`, projects into a DataFrame with `cell_type` (from `extraction answer`) + `gold_ontology_id`. The BioSample → ChIP-Atlas `cell_type` join was sidestepped: the TSV's extraction-answer column already has the free-text cell-line name, so we skip the SRA bridge.
+  - `tests/validation/metrics.py`: `AccuracyReport` with `accuracy_at_1`, `pick_precision` (correct / committed), `unmappable_recall`, `coverage`; counts abstentions separately from wrong IDs so a high-abstention tier is distinguishable from a low-accuracy one
+  - `tests/validation/runner.py`: `Mode.CELLOSAURUS_ONLY` (injects null embedder + null LLM → measures Stage 2 alone) and `Mode.FULL` (real pipeline) drivers on top of `map_chipatlas`
+  - `tests/validation/test_accuracy.py`: gated on `CAOM_RUN_VALIDATION=1`; full-pipeline sub-gate additionally needs `CAOM_RUN_LLM_VALIDATION=1`. Stage 2 baseline observed 2026-04-22: `acc@1=0.903, pick_precision=1.000, unmap_recall=0.997, coverage=0.450` (Cellosaurus v49, EFO v3.89). Gate floors set below observed to absorb version drift.
+  - 87 tests passing (17 new offline: loader + metrics unit tests); 2 validation-gate tests skip by default
+- **Stage 6: full-pipeline threshold tuning (once `qwen2.5:7b-instruct` is pulled)** — NEXT
 
 Each stage is independently useful. Stage 2 alone handles ~75% of real ChIP-Atlas contexts (cell lines).
 
@@ -107,8 +113,10 @@ Output: Mapping row (best-pick) or ReviewRow (review=True)
 4. Wire re-rank into `map_chipatlas()`: retrieval → LLM pick → emit `Mapping` row with confidence + rationale.
 
 ### Stage 5: Validation harness
-1. `tests/validation/ikeda_gold_standard.py`: download `biosample_cellosaurus_mapping_gold_standard.tsv` from Zenodo DOI 10.5281/zenodo.14881142. Join to ChIP-Atlas metadata to extract the `cell_type` string for each BioSample ID (this is the actual input shape for `caom`).
-2. `tests/validation/test_accuracy.py`: run `caom.map_chipatlas()` on the joined DataFrame, assert accuracy@1 ≥ threshold. Gate should be tightened as each stage lands (Stage 2 alone should hit a high number on cell-line rows).
+1. `tests/validation/ikeda_gold_standard.py`: download `biosample_cellosaurus_mapping_gold_standard.tsv` from Zenodo DOI 10.5281/zenodo.14881142. The TSV's `extraction answer` column is the free-text cell-line name already (it's what Ikeda's LLM extracted from BioSample metadata); we use it directly as `cell_type` input rather than joining through SRA to ChIP-Atlas, which would need a second large data source for no new signal. Gold Cellosaurus IDs are normalized from `CVCL:NNNN` to `CVCL_NNNN` to match Cellosaurus parser output.
+2. `tests/validation/metrics.py`: `AccuracyReport` with `accuracy_at_1`, `pick_precision`, `unmappable_recall`, `coverage`. Abstentions counted separately from wrong-ID picks so a cautious tier reads differently from an inaccurate one.
+3. `tests/validation/runner.py`: modes for running just the Cellosaurus fast-path (null embedder + null LLM) vs. full pipeline. Both reuse `caom.api.map_chipatlas` rather than duplicating orchestration.
+4. `tests/validation/test_accuracy.py`: gated on `CAOM_RUN_VALIDATION=1` (Stage 2) and `CAOM_RUN_LLM_VALIDATION=1` (full pipeline). Thresholds set below observed baseline to absorb version drift; tighten after each pipeline change.
 
 ## Anti-goals (resist these)
 
