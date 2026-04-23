@@ -10,17 +10,23 @@ These tests are opt-in because they require:
 Set ``CAOM_RUN_VALIDATION=1`` to run the Stage 2 fast-path gate.
 Set ``CAOM_RUN_LLM_VALIDATION=1`` *in addition* to also run the full-pipeline gate.
 
-Calibration notes (Cellosaurus v49, EFO v3.89, qwen2.5:7b-instruct):
+Calibration notes (Cellosaurus v49, EFO v3.89):
 
-    2026-04-22, Stage 2 fast-path only:
+    2026-04-22, Stage 2 fast-path only (qwen2.5:7b-instruct):
       n=600  acc@1=0.903  pick_precision=1.000  unmap_recall=0.997  coverage=0.450
 
-    2026-04-22, Stage 8 full pipeline (Cellosaurus → retrieval → LLM re-rank):
+    2026-04-22, Stage 8 full pipeline (qwen2.5:7b-instruct):
       n=600  acc@1=0.933  pick_precision=0.989  unmap_recall=0.977  coverage=0.480
+
+    2026-04-23, Stage 9 full pipeline (qwen2.5:14b — local 7b absent):
+      n=600  acc@1=0.950  pick_precision=0.990  unmap_recall=0.964  coverage=0.495
 
 The gate floors below are set a few points below the observed numbers to
 absorb Cellosaurus / EFO / model-version churn. Tighten when numbers stabilize
 across a couple of stage runs; loosen if a legitimate version bump trips them.
+
+Note: Stage 9 was measured on qwen2.5:14b because the 7b-instruct model was
+not locally installed at the time. Stage 10 re-anchors the baseline to 7b.
 """
 
 from __future__ import annotations

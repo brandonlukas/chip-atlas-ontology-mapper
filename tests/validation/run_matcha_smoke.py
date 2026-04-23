@@ -31,6 +31,7 @@ MATCHA_PARQUET = Path("/home/brandon/code/matcha/data/metadata/curated_metadata.
 #   - edge cases (numeric codes, punctuation variants, disease-as-context)
 #   - Stage 7 failure-mode queries that motivated the allow-list filter
 #   - Stage 9 subtype-overshoot probes (Brain, Lung, Pancreatic islets)
+#   - Stage 9 head-to-head additions vs mochi (`iPSC derived neural cells`)
 TARGET_CELL_TYPES: list[str] = [
     "K-562",
     "MCF-7",
@@ -40,6 +41,7 @@ TARGET_CELL_TYPES: list[str] = [
     "HAP1",
     "CD4+ T cells",
     "iPS cells",
+    "iPSC derived neural cells",
     "Pancreatic islets",
     "Brain",
     "Lung",

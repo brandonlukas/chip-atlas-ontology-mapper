@@ -259,11 +259,25 @@ def _retrieve_efo(
     embedder: EmbedderProtocol,
     top_k: int,
 ) -> dict[int, list[Candidate]]:
+    """Per-row EFO candidates: exact-match hits prepended to FAISS top-K.
+
+    Exact matches keyed on the raw `cell_type` string (not the
+    metadata-augmented FAISS query) so the symmetric-normalization invariant
+    holds — corpus labels / synonyms don't carry surrounding context.
+    """
     if not indices:
         return {}
     queries = [_efo_query_text(normalized[i], df.iloc[i]) for i in indices]
     batches = efo_index.search_texts(queries, embedder=embedder, top_k=top_k)
-    return dict(zip(indices, batches, strict=True))
+    out: dict[int, list[Candidate]] = {}
+    for i, faiss_cands in zip(indices, batches, strict=True):
+        exact_cands = efo_index.exact_lookup(normalized[i])
+        if not exact_cands:
+            out[i] = faiss_cands
+            continue
+        seen = {c.ontology_id for c in exact_cands}
+        out[i] = exact_cands + [c for c in faiss_cands if c.ontology_id not in seen]
+    return out
 
 
 def _run_review(

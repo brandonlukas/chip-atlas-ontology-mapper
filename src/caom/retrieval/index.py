@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import pickle
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -12,12 +13,14 @@ import numpy as np
 import pandas as pd
 
 from caom.cache import KeyedCache, write_metadata_sidecar
+from caom.ontologies.cellosaurus import normalize_name
 from caom.retrieval.embedder import EmbedderProtocol
 from caom.types import Candidate
 
 INDEX_FILENAME = "efo.faiss"
 TERMS_FILENAME = "efo_terms.parquet"
 META_FILENAME = "efo.metadata.json"
+EXACT_FILENAME = "efo.exact.pkl"
 
 # Allow-list of CURIE prefixes that are legitimate answers to "what cell /
 # tissue / cell-line / disease context was this ChIP-Atlas assay run in".
@@ -30,6 +33,18 @@ META_FILENAME = "efo.metadata.json"
 # cosine search over the full corpus reliably buries the correct UBERON / CL
 # / EFO answer beneath non-context noise.
 #
+# Stage 9 further narrowed the list. Cell-line mirrors and overlap ontologies
+# were burying the canonical CL / UBERON / MONDO answer at rank 1:
+#   - `EFO`, `CLO`, `BTO` cell-line / tissue mirrors duplicate Cellosaurus
+#     (which is already the first-class cell-line source) and pull the LLM
+#     onto specific cell-line entries when the query is generic (`iPSC
+#     derived neural cells` → `EFO:0007106 iPS-18b`).
+#   - `NCIT` and `Orphanet` overlap MONDO and occasionally outrank the
+#     canonical MONDO root with a more-specific subtype (`Acute myeloid
+#     leukemia` → `MONDO:0100374` instead of `MONDO:0018874`).
+# Cellosaurus stays the cell-line answer; CL / UBERON / MONDO are the only
+# context answers we keep in the FAISS corpus.
+#
 # Allow-list (not deny-list) so future ontology refreshes can't silently
 # re-introduce contamination — a new import is excluded by default until a
 # human adds it here. Anything filtered out here still lives in the raw
@@ -38,12 +53,7 @@ _ALLOWED_PREFIXES: frozenset[str] = frozenset({
     # Core context ontologies.
     "CL",        # Cell Ontology — primary cell types
     "UBERON",    # cross-species anatomy
-    "EFO",       # Experimental Factor Ontology (cell lines, contexts, diseases)
-    "CLO",       # Cell Line Ontology
-    "BTO",       # BRENDA Tissue Ontology
     "MONDO",     # disease ontology
-    "Orphanet",  # rare-disease IDs surfaced via MONDO / EFO
-    "NCIT",      # cancer-type entries occasionally used as contexts
     # Organism-specific anatomy / life-stage ontologies.
     "FBbt",      # Drosophila anatomy
     "FBdv",      # Drosophila development
@@ -101,6 +111,34 @@ def build_corpus_text(row: pd.Series | dict) -> str:
     return " | ".join(parts)
 
 
+def build_exact_index(terms_df: pd.DataFrame) -> dict[str, list[int]]:
+    """Map normalized label/synonym → row indices into `terms_df`.
+
+    Uses the same normalization as the Cellosaurus fast-path (`normalize_name`:
+    lowercase + strip non-alphanumerics) so a query like `"PBMC"` matches a
+    synonym `"PBMC"` and a label `"pbmc"` interchangeably.
+
+    Multiple ontology rows may share a normalized form (a synonym collision
+    across two CL terms, an EFO mirror of a CL label, etc.); the value list
+    preserves insertion order so the LLM sees the candidates in row order.
+    """
+    out: dict[str, list[int]] = {}
+    for i, row in enumerate(terms_df.itertuples(index=False)):
+        keys: set[str] = set()
+        label = getattr(row, "label", None)
+        if label:
+            k = normalize_name(str(label))
+            if k:
+                keys.add(k)
+        for syn in _coerce_synonyms(getattr(row, "synonyms", None)):
+            k = normalize_name(syn)
+            if k:
+                keys.add(k)
+        for k in keys:
+            out.setdefault(k, []).append(i)
+    return out
+
+
 @dataclass
 class EFOIndex:
     """FAISS cosine-similarity index + row-aligned EFO terms DataFrame."""
@@ -110,6 +148,37 @@ class EFOIndex:
     embedding_model: str
     efo_version: str
     built_at: str
+    exact_index: dict[str, list[int]] = field(default_factory=dict)
+
+    def exact_lookup(self, query: str) -> list[Candidate]:
+        """Return EFO Candidates whose label or any synonym exact-matches `query`.
+
+        Match is symmetric — query and corpus are both run through
+        `normalize_name` (lowercase + strip non-alphanumerics). Empty / blank
+        queries return `[]`. Each returned Candidate has `exact=True` and
+        `retrieval_score=1.0` so the LLM sees a stable, max-confidence signal
+        distinguishable from FAISS cosine scores.
+        """
+        key = normalize_name(query)
+        if not key:
+            return []
+        row_idxs = self.exact_index.get(key, [])
+        cands: list[Candidate] = []
+        for i in row_idxs:
+            row = self.terms.iloc[int(i)]
+            definition = row["definition"] if row["definition"] else None
+            cands.append(
+                Candidate(
+                    ontology_id=str(row["ontology_id"]),
+                    ontology_label=str(row["label"]),
+                    ontology_source="efo",
+                    synonyms=_coerce_synonyms(row["synonyms"]),
+                    definition=str(definition) if definition is not None else None,
+                    retrieval_score=1.0,
+                    exact=True,
+                )
+            )
+        return cands
 
     def search_vectors(
         self, query_vecs: np.ndarray, top_k: int
@@ -186,12 +255,14 @@ def build_index(
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
+    terms_reset = terms_df.reset_index(drop=True)
     return EFOIndex(
         faiss_index=index,
-        terms=terms_df.reset_index(drop=True),
+        terms=terms_reset,
         embedding_model=embedding_model,
         efo_version=efo_version,
         built_at=datetime.now(UTC).isoformat(),
+        exact_index=build_exact_index(terms_reset),
     )
 
 
@@ -202,6 +273,8 @@ def save_index(cache_root: Path, index: EFOIndex) -> None:
     d.mkdir(parents=True, exist_ok=True)
     faiss.write_index(index.faiss_index, str(d / INDEX_FILENAME))
     index.terms.to_parquet(d / TERMS_FILENAME, index=False)
+    with open(d / EXACT_FILENAME, "wb") as f:
+        pickle.dump(index.exact_index, f, protocol=pickle.HIGHEST_PROTOCOL)
     write_metadata_sidecar(
         d,
         {
@@ -210,6 +283,7 @@ def save_index(cache_root: Path, index: EFOIndex) -> None:
             "built_at": index.built_at,
             "term_count": len(index.terms),
             "dim": int(index.faiss_index.d),
+            "exact_key_count": len(index.exact_index),
         },
         filename=META_FILENAME,
     )
@@ -228,12 +302,21 @@ def load_index(cache_root: Path) -> EFOIndex:
     faiss_index = faiss.read_index(str(idx_path))
     terms = pd.read_parquet(d / TERMS_FILENAME)
     meta = json.loads((d / META_FILENAME).read_text())
+    exact_path = d / EXACT_FILENAME
+    if exact_path.exists():
+        with open(exact_path, "rb") as f:
+            exact_index = pickle.load(f)
+    else:
+        # Legacy cache predating Stage 9 — derive from the parquet so callers
+        # don't have to re-run `update_ontologies` just to pick up the layer.
+        exact_index = build_exact_index(terms)
     return EFOIndex(
         faiss_index=faiss_index,
         terms=terms,
         embedding_model=meta.get("embedding_model", ""),
         efo_version=meta.get("efo_version", ""),
         built_at=meta.get("built_at", ""),
+        exact_index=exact_index,
     )
 
 

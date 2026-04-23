@@ -11,6 +11,7 @@ import pytest
 from caom.retrieval.index import (
     EFOIndex,
     build_corpus_text,
+    build_exact_index,
     build_index,
     filter_corpus,
     get_cached_index,
@@ -168,12 +169,7 @@ def _row(ontology_id: str) -> dict:
     [
         "CL:0000624",       # T cell
         "UBERON:0002048",   # lung
-        "EFO:0001187",      # HEK293
-        "CLO:0001230",      # cell line entry
-        "BTO:0000001",      # BRENDA tissue
         "MONDO:0004992",    # cancer
-        "Orphanet:586",     # rare disease
-        "NCIT:C12439",      # NCI thesaurus
         "FBbt:00005106",    # Drosophila anatomy
         "FBdv:00005334",    # Drosophila development
         "ZFA:0000001",      # zebrafish anatomy
@@ -192,6 +188,13 @@ def test_filter_corpus_keeps_allowed_prefixes(allowed_id: str):
 @pytest.mark.parametrize(
     "excluded_id",
     [
+        # Stage 9: cell-line / tissue mirrors of Cellosaurus + MONDO subtypes.
+        "EFO:0007106",         # iPS-18b cell-line mirror — buries CL parents
+        "CLO:0001230",         # Cell Line Ontology
+        "BTO:0000001",         # BRENDA Tissue Ontology
+        "Orphanet:586",        # overlaps MONDO disease entries
+        "NCIT:C12439",         # cancer-type mirror of MONDO
+        # Stage 7 exclusions (still excluded).
         "PR:000001",           # protein
         "HGNC:5",              # gene symbol
         "OBA:0000001",         # biological attribute
@@ -220,13 +223,152 @@ def test_filter_corpus_preserves_row_order_and_resets_index():
         _row("OBA:0000001"),
         _row("UBERON:0000001"),
         _row("HGNC:5"),
+        _row("EFO:0007106"),    # Stage 9: cell-line mirror — drop
+        _row("MONDO:0000001"),
     ])
     out = filter_corpus(df)
-    assert list(out["ontology_id"]) == ["CL:0000001", "UBERON:0000001"]
-    assert list(out.index) == [0, 1]
+    assert list(out["ontology_id"]) == [
+        "CL:0000001",
+        "UBERON:0000001",
+        "MONDO:0000001",
+    ]
+    assert list(out.index) == [0, 1, 2]
 
 
 def test_filter_corpus_drops_rows_with_no_prefix():
     df = pd.DataFrame([_row("CL:0000001"), _row("no_colon_here"), _row("")])
     out = filter_corpus(df)
     assert list(out["ontology_id"]) == ["CL:0000001"]
+
+
+# -- exact-match retrieval (Stage 9) -----------------------------------------
+
+
+def _exact_terms() -> pd.DataFrame:
+    """Two rows that share a normalized synonym key on purpose.
+
+    `CL:0000624` (helper T cell) carries `T-helper` as a synonym; `CL:0000896`
+    (activated CD4 T cell) carries `T helper` as a synonym. After
+    normalization both collapse to `thelper`, exercising the multi-row
+    lookup path the LLM disambiguates from.
+    """
+    return pd.DataFrame(
+        [
+            {
+                "ontology_id": "UBERON:0002048",
+                "label": "lung",
+                "synonyms": ["pulmonary tissue"],
+                "definition": "Respiration organ.",
+                "parents": [],
+            },
+            {
+                "ontology_id": "CL:0000624",
+                "label": "CD4-positive, alpha-beta T cell",
+                "synonyms": ["T-helper", "CD4+ T cell"],
+                "definition": None,
+                "parents": [],
+            },
+            {
+                "ontology_id": "CL:0000896",
+                "label": "activated CD4-positive, alpha-beta T cell",
+                "synonyms": ["T helper"],
+                "definition": None,
+                "parents": [],
+            },
+        ]
+    )
+
+
+def test_build_exact_index_keys_label_and_synonyms_after_normalization():
+    idx = build_exact_index(_exact_terms())
+    # Labels lowered + non-alnum stripped.
+    assert idx["lung"] == [0]
+    # Synonyms are indexed.
+    assert idx["pulmonarytissue"] == [0]
+    # Punctuation in the query collapses to the same key as the corpus.
+    assert idx["cd4tcell"] == [1]
+    # Two rows hashing to the same normalized key surface in row order.
+    assert idx["thelper"] == [1, 2]
+
+
+def test_exact_lookup_returns_candidates_with_exact_flag_and_unit_score():
+    terms = _exact_terms()
+    embs = _orthonormal_embeddings(len(terms), dim=4)
+    index = build_index(terms, embs, embedding_model="t", efo_version="v")
+
+    cands = index.exact_lookup("Lung")
+    assert len(cands) == 1
+    assert cands[0].ontology_id == "UBERON:0002048"
+    assert cands[0].exact is True
+    assert cands[0].retrieval_score == pytest.approx(1.0)
+    assert cands[0].ontology_source == "efo"
+
+
+def test_exact_lookup_handles_punctuation_variants_symmetrically():
+    terms = _exact_terms()
+    embs = _orthonormal_embeddings(len(terms), dim=4)
+    index = build_index(terms, embs, embedding_model="t", efo_version="v")
+
+    # Synonym `CD4+ T cell` → key `cd4tcell`; query variants that differ
+    # only by punctuation / case must collapse the same way for the exact
+    # layer to be a true short-circuit. Plural mismatch (`CD4+ T cells`)
+    # is intentionally NOT covered — that's deferred to the substring
+    # fallback per the Stage 9 plan.
+    for query in ("CD4+ T cell", "cd4+ t cell", "CD4 T cell", "cd4-tcell"):
+        cands = index.exact_lookup(query)
+        ids = [c.ontology_id for c in cands]
+        assert "CL:0000624" in ids, query
+
+
+def test_exact_lookup_returns_all_collisions_in_row_order():
+    terms = _exact_terms()
+    embs = _orthonormal_embeddings(len(terms), dim=4)
+    index = build_index(terms, embs, embedding_model="t", efo_version="v")
+
+    cands = index.exact_lookup("T helper")
+    assert [c.ontology_id for c in cands] == ["CL:0000624", "CL:0000896"]
+
+
+def test_exact_lookup_empty_or_unknown_query_returns_empty():
+    terms = _exact_terms()
+    embs = _orthonormal_embeddings(len(terms), dim=4)
+    index = build_index(terms, embs, embedding_model="t", efo_version="v")
+
+    assert index.exact_lookup("") == []
+    assert index.exact_lookup("    ") == []
+    assert index.exact_lookup("nonsense xyz") == []
+
+
+def test_save_load_persists_exact_index(tmp_path: Path):
+    terms = _exact_terms()
+    embs = _orthonormal_embeddings(len(terms), dim=4)
+    save_index(
+        tmp_path,
+        build_index(terms, embs, embedding_model="t", efo_version="v"),
+    )
+
+    assert (tmp_path / "embeddings" / "efo.exact.pkl").exists()
+
+    reloaded = load_index(tmp_path)
+    assert reloaded.exact_index["lung"] == [0]
+    assert reloaded.exact_lookup("T helper")[0].ontology_id == "CL:0000624"
+
+
+def test_load_index_falls_back_to_rebuilt_exact_index_when_pkl_missing(
+    tmp_path: Path,
+):
+    """Legacy caches predating Stage 9 don't have efo.exact.pkl on disk.
+
+    Loading should still produce a populated `exact_index` so callers don't
+    have to re-run `update_ontologies` just to get the lookup path.
+    """
+    terms = _exact_terms()
+    embs = _orthonormal_embeddings(len(terms), dim=4)
+    save_index(
+        tmp_path,
+        build_index(terms, embs, embedding_model="t", efo_version="v"),
+    )
+    (tmp_path / "embeddings" / "efo.exact.pkl").unlink()
+
+    reloaded = load_index(tmp_path)
+    assert reloaded.exact_lookup("Lung")[0].ontology_id == "UBERON:0002048"

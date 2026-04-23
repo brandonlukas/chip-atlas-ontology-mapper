@@ -196,6 +196,72 @@ def test_best_pick_without_efo_cache_raises_when_llm_needed(tmp_path: Path):
         )
 
 
+# --- Stage 9: exact-match retrieval layer ----------------------------------
+
+
+def test_exact_match_prepended_with_marker_and_dedupes_against_faiss(
+    tmp_path: Path,
+):
+    """Exact-match hit should land first in the prompt, marked `[exact]`,
+    and not duplicate the same id when FAISS top-K also returns it.
+
+    The fake corpus has `B cell` (CL:0000236) which is an exact-label match
+    for the query AND scores 1.0 via the `b cell` keyword in FakeEmbedder.
+    Without dedup the LLM would see CL:0000236 twice — once as exact, once
+    as cosine — and the prompt would lie about how many distinct candidates
+    exist.
+    """
+    install_full_cache(tmp_path)
+    from caom import map_chipatlas
+
+    llm = FakeLLMClient(
+        rules={
+            "cl:0000236": LLMPick(
+                ontology_id="CL:0000236",
+                confidence=0.95,
+                rationale="exact label match",
+            )
+        }
+    )
+    df = pd.DataFrame({"cell_type": ["B cell"]})
+    result = map_chipatlas(
+        df, cache_dir=tmp_path, embedder=FakeEmbedder(), llm_client=llm
+    )
+
+    assert result.loc[0, "ontology_id"] == "CL:0000236"
+    assert result.loc[0, "ontology_source"] == "efo"
+    (prompt,) = llm.calls
+    # Exactly one occurrence of the candidate id (no duplicate from FAISS).
+    assert prompt.count("CL:0000236") == 1
+    # The exact-match marker is rendered.
+    assert "[exact]" in prompt
+    # And the exact entry is at rank [0], i.e. prepended before any FAISS hits.
+    assert "[0] [exact]" in prompt
+
+
+def test_exact_match_returns_no_hit_when_query_has_none(tmp_path: Path):
+    """A query that has no normalized label / synonym match shouldn't
+    surface a `[exact]`-marked candidate; it should fall back to FAISS top-K
+    only. The system instructions reference `[exact]` in their rule text,
+    so the assertion targets the candidate-format marker specifically.
+    """
+    install_full_cache(tmp_path)
+    from caom import map_chipatlas
+
+    llm = FakeLLMClient(default_pick=LLMPick(
+        ontology_id="CL:0000182", confidence=0.5, rationale="cosine"
+    ))
+    df = pd.DataFrame({"cell_type": ["hepatocyte described in detail"]})
+    _ = map_chipatlas(
+        df, cache_dir=tmp_path, embedder=FakeEmbedder(), llm_client=llm
+    )
+
+    (prompt,) = llm.calls
+    # The candidate-rendering marker is `[N] [exact]`; the system block's
+    # `[exact]` mentions appear without the leading `] `.
+    assert "] [exact]" not in prompt
+
+
 def test_best_pick_llm_cache_suppresses_repeated_calls(tmp_path: Path):
     """Two map_chipatlas calls with the same (query, candidates) → one LLM call.
 

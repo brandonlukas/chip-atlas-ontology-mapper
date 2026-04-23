@@ -41,6 +41,10 @@ Rules:
   with no disambiguating metadata, return `null` unless a candidate's primary
   label or one of its synonyms is an exact, case-insensitive match for the
   query. Do not stretch a short query into a partial / disease-name match.
+- Candidates marked `[exact]` are label or exact-synonym matches for the
+  query (after lowercase + non-alphanumeric stripping). Prefer them over
+  cosine-ranked candidates unless the disambiguation context clearly
+  contradicts (wrong organism, wrong disease context, wrong cell-line series).
 - `confidence` is a float in [0, 1] reflecting how certain you are.
 - `rationale` is one short sentence explaining the choice.
 """
@@ -52,7 +56,11 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _format_candidate(index: int, c: Candidate) -> str:
-    parts = [f"[{index}] id={c.ontology_id} source={c.ontology_source} label={c.ontology_label!r}"]
+    marker = " [exact]" if c.exact else ""
+    parts = [
+        f"[{index}]{marker} id={c.ontology_id} source={c.ontology_source} "
+        f"label={c.ontology_label!r}"
+    ]
     if c.synonyms:
         shown = "; ".join(c.synonyms[:6])
         if len(c.synonyms) > 6:

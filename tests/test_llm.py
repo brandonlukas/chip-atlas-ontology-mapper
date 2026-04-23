@@ -162,6 +162,41 @@ def test_prompt_carries_stage8_disambiguation_rules():
     assert "do not stretch a short query" in flat
 
 
+def test_prompt_carries_stage9_exact_match_rule():
+    """Stage 9 introduced a `[exact]` marker for label/synonym matches.
+
+    The rule must instruct the LLM to prefer exact-marked candidates over
+    cosine-ranked ones unless the disambiguation context contradicts. A
+    future rewrite that drops it would silently undo the exact-match layer's
+    payoff on `Lung`, `PBMC`, `CD4+ T cells`, etc.
+    """
+    flat = " ".join(build_rerank_prompt("q", {}, []).lower().split())
+    assert "[exact]" in flat
+    assert "prefer them over cosine-ranked candidates" in flat
+
+
+def test_prompt_renders_exact_marker_for_exact_candidates():
+    candidates = [
+        _candidate(
+            ontology_id="UBERON:0002048",
+            ontology_label="lung",
+            score=1.0,
+        ),
+        _candidate(
+            ontology_id="UBERON:0001737",
+            ontology_label="larynx",
+            score=0.84,
+        ),
+    ]
+    candidates[0].exact = True
+
+    prompt = build_rerank_prompt("Lung", {}, candidates)
+    # Marker on the exact candidate, no marker on the cosine candidate.
+    assert "[0] [exact]" in prompt
+    assert "[1] [exact]" not in prompt
+    assert "[1] " in prompt
+
+
 # --- OllamaClient (with mocked inner client) --------------------------------
 
 

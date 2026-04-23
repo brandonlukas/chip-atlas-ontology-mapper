@@ -19,6 +19,7 @@ class Candidate(BaseModel):
     synonyms: list[str] = Field(default_factory=list)
     definition: str | None = None
     retrieval_score: float | None = None
+    exact: bool = False
 
 
 class LLMPick(BaseModel):
