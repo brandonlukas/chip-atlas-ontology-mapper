@@ -11,6 +11,7 @@ from caom.ontologies.efo import (
     EFOTerms,
     is_cached,
     load_terms,
+    normalize_ontology_id,
     parse_efo,
     refresh_cache,
     save_terms,
@@ -109,6 +110,74 @@ def test_load_without_cache_raises(tmp_path: Path):
 
 
 # -- refresh_cache honors existing cache -------------------------------------
+
+
+# -- normalize_ontology_id (Stage 6) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Already-CURIE forms pass through untouched.
+        ("CL:0000000", "CL:0000000"),
+        ("EFO:0001187", "EFO:0001187"),
+        ("UBERON:0002174", "UBERON:0002174"),
+        # EFO-native URIs → EFO CURIE (the dominant failure mode from the
+        # post-Stage-5 smoke test).
+        ("http://www.ebi.ac.uk/efo/EFO_0022456", "EFO:0022456"),
+        ("http://www.ebi.ac.uk/efo/EFO_0000001", "EFO:0000001"),
+        # Orphanet disease terms imported into EFO.
+        ("http://www.orpha.net/ORDO/Orphanet_100", "Orphanet:100"),
+        ("http://www.orpha.net/ORDO/Orphanet_100006", "Orphanet:100006"),
+        # BAO uses a `#` fragment.
+        ("http://www.bioassayontology.org/bao#BAO_0000875", "BAO:0000875"),
+        # DBpedia resources: tail is a label with underscores; keep it verbatim
+        # after the prefix so we don't corrupt multi-word names.
+        ("http://dbpedia.org/resource/Albania", "dbpedia:Albania"),
+        ("http://dbpedia.org/resource/Burkina_Faso", "dbpedia:Burkina_Faso"),
+    ],
+)
+def test_normalize_ontology_id(raw: str, expected: str):
+    assert normalize_ontology_id(raw) == expected
+
+
+def test_normalize_ontology_id_leaves_unknown_uri_unchanged():
+    # Unrecognized hosts pass through so callers can surface them rather
+    # than silently producing a wrong CURIE.
+    weird = "http://example.org/whatever/Foo_42"
+    assert normalize_ontology_id(weird) == weird
+
+
+def test_normalize_ontology_id_handles_empty():
+    assert normalize_ontology_id("") == ""
+
+
+def test_parse_efo_normalizes_uri_ontology_ids(tmp_path: Path):
+    """Full URI term IDs (pronto outputs these for hosts outside its idspace
+    map) should land in the parsed DataFrame as canonical CURIEs — for both
+    the term itself and every parent reference."""
+    obo = """\
+format-version: 1.2
+data-version: efo/releases/2099-01-01/efo.obo
+ontology: efo
+
+[Term]
+id: http://www.ebi.ac.uk/efo/EFO_0000001
+name: experimental factor
+
+[Term]
+id: http://www.ebi.ac.uk/efo/EFO_0022456
+name: example downstream term
+is_a: http://www.ebi.ac.uk/efo/EFO_0000001 ! experimental factor
+"""
+    p = tmp_path / "uri.obo"
+    p.write_text(obo)
+    df, _ = parse_efo(p)
+
+    ids = set(df["ontology_id"])
+    assert ids == {"EFO:0000001", "EFO:0022456"}
+    child = df.set_index("ontology_id").loc["EFO:0022456"]
+    assert child["parents"] == ["EFO:0000001"]
 
 
 def test_refresh_cache_skips_download_when_cached(tmp_path: Path, monkeypatch):

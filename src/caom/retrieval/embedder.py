@@ -34,9 +34,19 @@ class SentenceTransformerEmbedder:
     """
 
     def __init__(self, model_name: str, device: str | None = None):
+        from huggingface_hub import try_to_load_from_cache
         from sentence_transformers import SentenceTransformer
 
-        self._model = SentenceTransformer(model_name, device=device)
+        # If the model is already in the HF cache, load from disk without
+        # hitting the Hub. `map_chipatlas()` is advertised as offline (the
+        # only network-active entry point is `update_ontologies()`), and a
+        # per-call Hub HEAD request both violates that and emits an
+        # unauthenticated-rate-limit warning. `config.json` is a reliable
+        # cache probe because every sentence-transformers model ships one.
+        cached = try_to_load_from_cache(model_name, "config.json") is not None
+        self._model = SentenceTransformer(
+            model_name, device=device, local_files_only=cached
+        )
         get_dim = getattr(
             self._model,
             "get_embedding_dimension",

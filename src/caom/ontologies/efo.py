@@ -19,6 +19,37 @@ _EFO_RELEASE_RE = re.compile(r"/releases/(v[^/]+)/")
 
 EFO_URL = "http://www.ebi.ac.uk/efo/efo.owl"
 
+# URI → CURIE rules for ontology IDs that pronto emits in full-URI form
+# because they fall outside its built-in OBO idspace map. Each entry maps a
+# full URI prefix (everything up to and including the local-name separator)
+# to the CURIE prefix to emit. Rules are applied in order; first match wins.
+_URI_TO_CURIE_RULES: tuple[tuple[str, str], ...] = (
+    ("http://www.ebi.ac.uk/efo/EFO_", "EFO:"),
+    ("http://www.orpha.net/ORDO/Orphanet_", "Orphanet:"),
+    ("http://www.bioassayontology.org/bao#BAO_", "BAO:"),
+    # DBpedia resources: the tail is a label (possibly with underscores)
+    # rather than an opaque local id, so it's kept verbatim after the prefix.
+    ("http://dbpedia.org/resource/", "dbpedia:"),
+)
+
+
+def normalize_ontology_id(raw: str) -> str:
+    """Coerce an ontology ID to PREFIX:LOCAL CURIE form.
+
+    - Already-CURIE inputs (`CL:0000000`, `EFO:0000001`) pass through.
+    - URI inputs under known hosts are rewritten per `_URI_TO_CURIE_RULES`.
+    - URIs that don't match any rule are returned unchanged so the caller
+      can surface them rather than silently corrupting unknown forms.
+    """
+    if not raw or not raw.startswith("http"):
+        return raw
+    for uri_prefix, curie_prefix in _URI_TO_CURIE_RULES:
+        if raw.startswith(uri_prefix):
+            local = raw[len(uri_prefix):]
+            if local:
+                return curie_prefix + local
+    return raw
+
 # The ebi.ac.uk → GitHub release asset → Azure Blob redirect chain is flaky
 # on some networks: TLS records corrupt mid-stream. These constants tune
 # `download_efo`'s retry-with-Range-resume loop.
@@ -116,12 +147,16 @@ def parse_efo(path: Path) -> tuple[pd.DataFrame, str]:
             continue
         synonyms = sorted({s.description for s in term.synonyms if s.description})
         parents = sorted(
-            {p.id for p in term.superclasses(distance=1, with_self=False) if p.id}
+            {
+                normalize_ontology_id(p.id)
+                for p in term.superclasses(distance=1, with_self=False)
+                if p.id
+            }
         )
         definition = str(term.definition) if term.definition else None
         rows.append(
             {
-                "ontology_id": term.id,
+                "ontology_id": normalize_ontology_id(term.id),
                 "label": term.name,
                 "synonyms": synonyms,
                 "definition": definition,
