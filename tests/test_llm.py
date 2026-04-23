@@ -144,6 +144,24 @@ def test_prompt_caps_synonym_list():
     assert "+6 more" in prompt
 
 
+def test_prompt_carries_stage8_disambiguation_rules():
+    """Stage 8 added two principled rules — they must stay in the system block.
+
+    1. Cellosaurus-prefer when CVCL_ and EFO candidates describe the same entity.
+    2. Caution on ≤3-char queries with no disambiguating context.
+
+    Concretely worded so a future prompt rewrite that drops them will fail loudly
+    rather than silently reintroduce the BLaER / P493 / "ED" failure modes.
+    """
+    # Whitespace-flatten so soft-wrapped lines in the system block don't break
+    # phrase matching.
+    flat = " ".join(build_rerank_prompt("q", {}, []).lower().split())
+    assert "prefer the cellosaurus (cvcl_) id" in flat
+    assert "do not let a higher efo retrieval_score override this" in flat
+    assert "≤3 characters" in flat
+    assert "do not stretch a short query" in flat
+
+
 # --- OllamaClient (with mocked inner client) --------------------------------
 
 

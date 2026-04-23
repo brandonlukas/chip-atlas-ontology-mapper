@@ -10,13 +10,17 @@ These tests are opt-in because they require:
 Set ``CAOM_RUN_VALIDATION=1`` to run the Stage 2 fast-path gate.
 Set ``CAOM_RUN_LLM_VALIDATION=1`` *in addition* to also run the full-pipeline gate.
 
-Calibration notes (2026-04-22, Cellosaurus v49, EFO v3.89):
+Calibration notes (Cellosaurus v49, EFO v3.89, qwen2.5:7b-instruct):
 
-    Stage 2 fast-path only:
+    2026-04-22, Stage 2 fast-path only:
       n=600  acc@1=0.903  pick_precision=1.000  unmap_recall=0.997  coverage=0.450
 
+    2026-04-22, Stage 8 full pipeline (Cellosaurus → retrieval → LLM re-rank):
+      n=600  acc@1=0.933  pick_precision=0.989  unmap_recall=0.977  coverage=0.480
+
 The gate floors below are set a few points below the observed numbers to
-absorb Cellosaurus version churn (synonyms occasionally drop between releases).
+absorb Cellosaurus / EFO / model-version churn. Tighten when numbers stabilize
+across a couple of stage runs; loosen if a legitimate version bump trips them.
 """
 
 from __future__ import annotations
@@ -78,10 +82,17 @@ def test_cellosaurus_fast_path_accuracy_gate(gold, cache_root: Path) -> None:
     reason="Set CAOM_RUN_LLM_VALIDATION=1 to run the full-pipeline gate (needs Ollama).",
 )
 def test_full_pipeline_accuracy_gate(gold, cache_root: Path) -> None:
-    """Full pipeline (Cellosaurus → retrieval → LLM re-rank) must beat Stage 2."""
+    """Full pipeline (Cellosaurus → retrieval → LLM re-rank) must beat Stage 2.
+
+    `pick_precision` is gated separately so we can detect a regression where
+    the LLM starts committing to wrong ids without the overall acc@1 number
+    moving — the after-Stage-8 prompt is deliberately tuned for high precision
+    over coverage so a slip there is the more likely failure mode.
+    """
     pred = run_prediction(gold, mode=Mode.FULL, cache_root=cache_root)
     report = compute_accuracy(pred, gold)
     print(f"\n[full pipeline] {report.format()}")
 
-    assert report.accuracy_at_1 >= 0.88, report.format()
-    assert report.unmappable_recall >= 0.90, report.format()
+    assert report.accuracy_at_1 >= 0.91, report.format()
+    assert report.pick_precision >= 0.97, report.format()
+    assert report.unmappable_recall >= 0.95, report.format()

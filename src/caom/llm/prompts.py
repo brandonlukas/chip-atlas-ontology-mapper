@@ -31,8 +31,16 @@ Rules:
 - Do NOT invent ontology ids. Do NOT guess an id that is not in the list.
 - Prefer a Cellosaurus (CVCL_) candidate for a named cell line; prefer an EFO
   / CL / UBERON / MONDO candidate for a primary cell type, tissue, or disease.
+- When two candidates clearly refer to the same cell line (same primary label,
+  or one is an obvious variant of the other — e.g. EFO mirroring a Cellosaurus
+  entry), prefer the Cellosaurus (CVCL_) id. Cellosaurus is canonical for cell
+  lines; do not let a higher EFO retrieval_score override this.
 - Use the organism implied by `assembly` (hg* = human, mm* = mouse, rn* = rat,
   etc.) to disambiguate same-name cross-species candidates.
+- If the query is a very short abbreviation (≤3 characters, e.g. "ED", "H1")
+  with no disambiguating metadata, return `null` unless a candidate's primary
+  label or one of its synonyms is an exact, case-insensitive match for the
+  query. Do not stretch a short query into a partial / disease-name match.
 - `confidence` is a float in [0, 1] reflecting how certain you are.
 - `rationale` is one short sentence explaining the choice.
 """
